@@ -34,16 +34,16 @@ RUN mkdir -p eclair-core/src/main/scala && touch eclair-core/src/main/scala/empt
 RUN mvn install -pl eclair-node -am
 RUN mvn clean
 
-# Install plugins
-RUN curl -L https://github.com/evd0kim/eclair-alarmbot-plugin/archive/refs/tags/v0.8.0.zip --output eclair-alarmbot-plugin-0.8.0.zip
-RUN unzip eclair-alarmbot-plugin-0.8.0.zip && cd eclair-alarmbot-plugin-0.8.0&& mvn install && cd ..
-
 # Only then do we copy the sources
 COPY . .
 
 # And this time we can build in offline mode, specifying 'notag' instead of git commit
 RUN mvn package -pl eclair-node -am -DskipTests -Dgit.commit.id=notag -Dgit.commit.id.abbrev=notag -o
 # It might be good idea to run the tests here, so that the docker build fail if the code is bugged
+
+# Install plugins
+RUN curl -L https://github.com/evd0kim/eclair-alarmbot-plugin/archive/refs/tags/v0.8.0.zip --output eclair-alarmbot-plugin-0.8.0.zip
+RUN unzip eclair-alarmbot-plugin-0.8.0.zip && cd eclair-alarmbot-plugin-0.8.0&& mvn install && cd ..
 
 # We currently use a debian image for runtime because of some jni-related issue with sqlite
 FROM openjdk:11.0.4-jre-slim
