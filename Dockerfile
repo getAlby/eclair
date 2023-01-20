@@ -38,7 +38,10 @@ RUN mvn clean
 COPY . .
 
 # And this time we can build in offline mode, specifying 'notag' instead of git commit
-RUN mvn package -pl eclair-node -am -DskipTests -Dgit.commit.id=notag -Dgit.commit.id.abbrev=notag -o
+# Don't do this
+# RUN mvn package -pl eclair-node -am -DskipTests -Dgit.commit.id=notag -Dgit.commit.id.abbrev=notag -o
+# but do a temp full install to be able to install the plugins
+RUN mvn install -DskipTests=true
 # It might be good idea to run the tests here, so that the docker build fail if the code is bugged
 
 # Install plugins
