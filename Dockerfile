@@ -3,7 +3,7 @@ FROM adoptopenjdk/openjdk11:jdk-11.0.3_7-alpine as BUILD
 # Setup maven, we don't use https://hub.docker.com/_/maven/ as it declare .m2 as volume, we loose all mvn cache
 # We can alternatively do as proposed by https://github.com/carlossg/docker-maven#packaging-a-local-repository-with-the-image
 # this was meant to make the image smaller, but we use multi-stage build so we don't care
-RUN apk add --no-cache curl tar bash
+RUN apk add --no-cache curl tar bash unzip
 
 ARG MAVEN_VERSION=3.6.3
 ARG USER_HOME_DIR="/root"
@@ -33,6 +33,10 @@ RUN mkdir -p eclair-core/src/main/scala && touch eclair-core/src/main/scala/empt
 # Blank build. We only care about eclair-node, and we use install because eclair-node depends on eclair-core
 RUN mvn install -pl eclair-node -am
 RUN mvn clean
+
+# Install plugins
+RUN curl -L https://github.com/evd0kim/eclair-alarmbot-plugin/archive/refs/tags/v0.8.0.zip --output eclair-alarmbot-plugin-0.8.0.zip
+RUN unzip eclair-alarmbot-plugin-0.8.0.zip && cd eclair-alarmbot-plugin-0.8.0&& mvn install && cd ..
 
 # Only then do we copy the sources
 COPY . .
