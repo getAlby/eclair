@@ -42,7 +42,7 @@ object LocalNodeKeyManager {
 class LocalNodeKeyManager(seed: ByteVector, chainHash: ByteVector32) extends NodeKeyManager with Logging {
   private val master = DeterministicWallet.generate(seed)
 
-  override val nodeKey: ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, LocalNodeKeyManager.keyBasePath(chainHash))
+  override val nodeKey: ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, "m/1017'/1'/6'/0")
   override val nodeId: PublicKey = nodeKey.publicKey
 
   override def signDigest(digest: ByteVector32, privateKey: PrivateKey = nodeKey.privateKey): (ByteVector64, Int) = {
