@@ -28,7 +28,7 @@ object LocalNodeKeyManager {
   // Note that the node path and the above channel path are on different branches so even if the
   // node key is compromised there is no way to retrieve the wallet keys
   def keyBasePath(chainHash: ByteVector32): List[Long] = (chainHash: @unchecked) match {
-    case Block.RegtestGenesisBlock.hash | Block.TestnetGenesisBlock.hash | Block.SignetGenesisBlock.hash => List(DeterministicWallet.hardened(1017), DeterministicWallet.hardened(1), DeterministicWallet.hardened(6))
+    case Block.RegtestGenesisBlock.hash | Block.TestnetGenesisBlock.hash | Block.SignetGenesisBlock.hash => List(DeterministicWallet.hardened(6), DeterministicWallet.hardened(1), DeterministicWallet.hardened(1017))
     case Block.LivenetGenesisBlock.hash => DeterministicWallet.hardened(47) :: DeterministicWallet.hardened(0) :: Nil
   }
 }
