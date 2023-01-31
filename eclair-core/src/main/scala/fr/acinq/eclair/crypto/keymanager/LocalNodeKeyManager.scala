@@ -17,7 +17,7 @@
 package fr.acinq.eclair.crypto.keymanager
 
 import fr.acinq.bitcoin.scalacompat.Crypto.{PrivateKey, PublicKey}
-import fr.acinq.bitcoin.scalacompat.DeterministicWallet.ExtendedPrivateKey
+import fr.acinq.bitcoin.scalacompat.DeterministicWallet.{ExtendedPrivateKey, KeyPath}
 import fr.acinq.bitcoin.scalacompat.{Block, ByteVector32, ByteVector64, Crypto, DeterministicWallet}
 import fr.acinq.eclair.router.Announcements
 import grizzled.slf4j.Logging
@@ -42,7 +42,7 @@ object LocalNodeKeyManager {
 class LocalNodeKeyManager(seed: ByteVector, chainHash: ByteVector32) extends NodeKeyManager with Logging {
   private val master = DeterministicWallet.generate(seed)
 
-  override val nodeKey: ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, "m/1017'/1'/6'/0")
+  override val nodeKey: ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, KeyPath("m/1017'/1'/6'/0"))
   override val nodeId: PublicKey = nodeKey.publicKey
 
   override def signDigest(digest: ByteVector32, privateKey: PrivateKey = nodeKey.privateKey): (ByteVector64, Int) = {
