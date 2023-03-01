@@ -23,6 +23,7 @@ import fr.acinq.bitcoin.scalacompat.{SatoshiLong, Script}
 import fr.acinq.eclair.blockchain.OnChainWallet.MakeFundingTxResponse
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher._
 import fr.acinq.eclair.channel.Helpers.Funding
+import fr.acinq.eclair.channel.LocalFundingStatus.SingleFundedUnconfirmedFundingTx
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.channel.fsm.Channel._
 import fr.acinq.eclair.channel.publish.TxPublisher.SetChannelId
@@ -30,7 +31,7 @@ import fr.acinq.eclair.crypto.ShaChain
 import fr.acinq.eclair.transactions.Transactions.TxOwner
 import fr.acinq.eclair.transactions.{Scripts, Transactions}
 import fr.acinq.eclair.wire.protocol.{AcceptChannel, AnnouncementSignatures, ChannelReady, ChannelTlv, Error, FundingCreated, FundingSigned, OpenChannel, TlvStream}
-import fr.acinq.eclair.{Features, MilliSatoshiLong, RealShortChannelId, UInt64, randomKey, toLongId}
+import fr.acinq.eclair.{MilliSatoshiLong, RealShortChannelId, UInt64, randomKey, toLongId}
 import scodec.bits.ByteVector
 
 import scala.util.{Failure, Success}
@@ -75,11 +76,7 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
       val channelKeyPath = keyManager.keyPath(input.localParams, input.channelConfig)
       // In order to allow TLV extensions and keep backwards-compatibility, we include an empty upfront_shutdown_script if this feature is not used
       // See https://github.com/lightningnetwork/lightning-rfc/pull/714.
-      val localShutdownScript = if (Features.canUseFeature(input.localParams.initFeatures, input.remoteInit.features, Features.UpfrontShutdownScript)) {
-        input.localParams.defaultFinalScriptPubKey
-      } else {
-        ByteVector.empty
-      }
+      val localShutdownScript = input.localParams.upfrontShutdownScript_opt.getOrElse(ByteVector.empty)
       val open = OpenChannel(
         chainHash = nodeParams.chainHash,
         temporaryChannelId = input.temporaryChannelId,
@@ -118,7 +115,7 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
           log.info("will use fundingMinDepth={}", minimumDepth)
           // In order to allow TLV extensions and keep backwards-compatibility, we include an empty upfront_shutdown_script if this feature is not used.
           // See https://github.com/lightningnetwork/lightning-rfc/pull/714.
-          val localShutdownScript = if (Features.canUseFeature(d.initFundee.localParams.initFeatures, d.initFundee.remoteInit.features, Features.UpfrontShutdownScript)) d.initFundee.localParams.defaultFinalScriptPubKey else ByteVector.empty
+          val localShutdownScript = d.initFundee.localParams.upfrontShutdownScript_opt.getOrElse(ByteVector.empty)
           val accept = AcceptChannel(temporaryChannelId = open.temporaryChannelId,
             dustLimitSatoshis = d.initFundee.localParams.dustLimit,
             maxHtlcValueInFlightMsat = UInt64(d.initFundee.localParams.maxHtlcValueInFlightMsat.toLong),
@@ -151,9 +148,10 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
             delayedPaymentBasepoint = open.delayedPaymentBasepoint,
             htlcBasepoint = open.htlcBasepoint,
             initFeatures = d.initFundee.remoteInit.features,
-            shutdownScript = remoteShutdownScript)
+            upfrontShutdownScript_opt = remoteShutdownScript)
           log.debug("remote params: {}", remoteParams)
-          goto(WAIT_FOR_FUNDING_CREATED) using DATA_WAIT_FOR_FUNDING_CREATED(open.temporaryChannelId, d.initFundee.localParams, remoteParams, open.fundingSatoshis, open.pushMsat, open.feeratePerKw, open.firstPerCommitmentPoint, open.channelFlags, d.initFundee.channelConfig, channelFeatures, accept) sending accept
+          val params = ChannelParams(d.initFundee.temporaryChannelId, d.initFundee.channelConfig, channelFeatures, d.initFundee.localParams, remoteParams, open.channelFlags)
+          goto(WAIT_FOR_FUNDING_CREATED) using DATA_WAIT_FOR_FUNDING_CREATED(params, open.fundingSatoshis, open.pushMsat, open.feeratePerKw, open.firstPerCommitmentPoint) sending accept
       }
 
     case Event(c: CloseCommand, d) => handleFastClose(c, d.channelId)
@@ -184,13 +182,14 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
             delayedPaymentBasepoint = accept.delayedPaymentBasepoint,
             htlcBasepoint = accept.htlcBasepoint,
             initFeatures = init.remoteInit.features,
-            shutdownScript = remoteShutdownScript)
+            upfrontShutdownScript_opt = remoteShutdownScript)
           log.debug("remote params: {}", remoteParams)
           log.info("remote will use fundingMinDepth={}", accept.minimumDepth)
           val localFundingPubkey = keyManager.fundingPublicKey(init.localParams.fundingKeyPath)
           val fundingPubkeyScript = Script.write(Script.pay2wsh(Scripts.multiSig2of2(localFundingPubkey.publicKey, remoteParams.fundingPubKey)))
           wallet.makeFundingTx(fundingPubkeyScript, init.fundingAmount, init.fundingTxFeerate).pipeTo(self)
-          goto(WAIT_FOR_FUNDING_INTERNAL) using DATA_WAIT_FOR_FUNDING_INTERNAL(init.temporaryChannelId, init.localParams, remoteParams, init.fundingAmount, init.pushAmount_opt.getOrElse(0 msat), init.commitTxFeerate, accept.firstPerCommitmentPoint, init.channelConfig, channelFeatures, open)
+          val params = ChannelParams(init.temporaryChannelId, init.channelConfig, channelFeatures, init.localParams, remoteParams, open.channelFlags)
+          goto(WAIT_FOR_FUNDING_INTERNAL) using DATA_WAIT_FOR_FUNDING_INTERNAL(params, init.fundingAmount, init.pushAmount_opt.getOrElse(0 msat), init.commitTxFeerate, accept.firstPerCommitmentPoint)
       }
 
     case Event(c: CloseCommand, d: DATA_WAIT_FOR_ACCEPT_CHANNEL) =>
@@ -211,13 +210,14 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
   })
 
   when(WAIT_FOR_FUNDING_INTERNAL)(handleExceptions {
-    case Event(MakeFundingTxResponse(fundingTx, fundingTxOutputIndex, fundingTxFee), d@DATA_WAIT_FOR_FUNDING_INTERNAL(temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint, channelConfig, channelFeatures, open)) =>
+    case Event(MakeFundingTxResponse(fundingTx, fundingTxOutputIndex, fundingTxFee), d@DATA_WAIT_FOR_FUNDING_INTERNAL(params, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint)) =>
+      val temporaryChannelId = params.channelId
       // let's create the first commitment tx that spends the yet uncommitted funding tx
-      Funding.makeFirstCommitTxs(keyManager, channelConfig, channelFeatures, temporaryChannelId, localParams, remoteParams, localFundingAmount = fundingAmount, remoteFundingAmount = 0 sat, localPushAmount = pushMsat, remotePushAmount = 0 msat, commitTxFeerate, fundingTx.hash, fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
+      Funding.makeFirstCommitTxs(keyManager, params, localFundingAmount = fundingAmount, remoteFundingAmount = 0 sat, localPushAmount = pushMsat, remotePushAmount = 0 msat, commitTxFeerate, fundingTx.hash, fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
         case Left(ex) => handleLocalError(ex, d, None)
         case Right((localSpec, localCommitTx, remoteSpec, remoteCommitTx)) =>
           require(fundingTx.txOut(fundingTxOutputIndex).publicKeyScript == localCommitTx.input.txOut.publicKeyScript, s"pubkey script mismatch!")
-          val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(localParams.fundingKeyPath), TxOwner.Remote, channelFeatures.commitmentFormat)
+          val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, keyManager.fundingPublicKey(params.localParams.fundingKeyPath), TxOwner.Remote, params.channelFeatures.commitmentFormat)
           // signature of their initial commitment tx that pays remote pushMsat
           val fundingCreated = FundingCreated(
             temporaryChannelId = temporaryChannelId,
@@ -226,21 +226,22 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
             signature = localSigOfRemoteTx
           )
           val channelId = toLongId(fundingTx.hash, fundingTxOutputIndex)
+          val params1 = params.copy(channelId = channelId)
           peer ! ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId) // we notify the peer asap so it knows how to route messages
           txPublisher ! SetChannelId(remoteNodeId, channelId)
           context.system.eventStream.publish(ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId))
           // NB: we don't send a ChannelSignatureSent for the first commit
-          goto(WAIT_FOR_FUNDING_SIGNED) using DATA_WAIT_FOR_FUNDING_SIGNED(channelId, localParams, remoteParams, fundingTx, fundingTxFee, localSpec, localCommitTx, RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint), open.channelFlags, channelConfig, channelFeatures, fundingCreated) sending fundingCreated
+          goto(WAIT_FOR_FUNDING_SIGNED) using DATA_WAIT_FOR_FUNDING_SIGNED(params1, fundingTx, fundingTxFee, localSpec, localCommitTx, RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint), fundingCreated) sending fundingCreated
       }
 
     case Event(Status.Failure(t), d: DATA_WAIT_FOR_FUNDING_INTERNAL) =>
       log.error(t, s"wallet returned error: ")
       channelOpenReplyToUser(Left(LocalError(t)))
-      handleLocalError(ChannelFundingError(d.temporaryChannelId), d, None) // we use a generic exception and don't send the internal error to the peer
+      handleLocalError(ChannelFundingError(d.channelId), d, None) // we use a generic exception and don't send the internal error to the peer
 
     case Event(c: CloseCommand, d: DATA_WAIT_FOR_FUNDING_INTERNAL) =>
-      channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelClosed(d.temporaryChannelId)))
-      handleFastClose(c, d.temporaryChannelId)
+      channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelClosed(d.channelId)))
+      handleFastClose(c, d.channelId)
 
     case Event(e: Error, d: DATA_WAIT_FOR_FUNDING_INTERNAL) =>
       channelOpenReplyToUser(Left(RemoteError(e)))
@@ -256,51 +257,52 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
   })
 
   when(WAIT_FOR_FUNDING_CREATED)(handleExceptions {
-    case Event(FundingCreated(_, fundingTxHash, fundingTxOutputIndex, remoteSig, _), d@DATA_WAIT_FOR_FUNDING_CREATED(temporaryChannelId, localParams, remoteParams, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint, channelFlags, channelConfig, channelFeatures, _)) =>
+    case Event(FundingCreated(_, fundingTxHash, fundingTxOutputIndex, remoteSig, _), d@DATA_WAIT_FOR_FUNDING_CREATED(params, fundingAmount, pushMsat, commitTxFeerate, remoteFirstPerCommitmentPoint)) =>
+      val temporaryChannelId = params.channelId
       // they fund the channel with their funding tx, so the money is theirs (but we are paid pushMsat)
-      Funding.makeFirstCommitTxs(keyManager, channelConfig, channelFeatures, temporaryChannelId, localParams, remoteParams, localFundingAmount = 0 sat, remoteFundingAmount = fundingAmount, localPushAmount = 0 msat, remotePushAmount = pushMsat, commitTxFeerate, fundingTxHash, fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
+      Funding.makeFirstCommitTxs(keyManager, params, localFundingAmount = 0 sat, remoteFundingAmount = fundingAmount, localPushAmount = 0 msat, remotePushAmount = pushMsat, commitTxFeerate, fundingTxHash, fundingTxOutputIndex, remoteFirstPerCommitmentPoint) match {
         case Left(ex) => handleLocalError(ex, d, None)
         case Right((localSpec, localCommitTx, remoteSpec, remoteCommitTx)) =>
           // check remote signature validity
-          val fundingPubKey = keyManager.fundingPublicKey(localParams.fundingKeyPath)
-          val localSigOfLocalTx = keyManager.sign(localCommitTx, fundingPubKey, TxOwner.Local, channelFeatures.commitmentFormat)
-          val signedLocalCommitTx = Transactions.addSigs(localCommitTx, fundingPubKey.publicKey, remoteParams.fundingPubKey, localSigOfLocalTx, remoteSig)
+          val fundingPubKey = keyManager.fundingPublicKey(params.localParams.fundingKeyPath)
+          val localSigOfLocalTx = keyManager.sign(localCommitTx, fundingPubKey, TxOwner.Local, params.channelFeatures.commitmentFormat)
+          val signedLocalCommitTx = Transactions.addSigs(localCommitTx, fundingPubKey.publicKey, params.remoteParams.fundingPubKey, localSigOfLocalTx, remoteSig)
           Transactions.checkSpendable(signedLocalCommitTx) match {
             case Failure(_) => handleLocalError(InvalidCommitmentSignature(temporaryChannelId, signedLocalCommitTx.tx.txid), d, None)
             case Success(_) =>
-              val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, fundingPubKey, TxOwner.Remote, channelFeatures.commitmentFormat)
+              val localSigOfRemoteTx = keyManager.sign(remoteCommitTx, fundingPubKey, TxOwner.Remote, params.channelFeatures.commitmentFormat)
               val channelId = toLongId(fundingTxHash, fundingTxOutputIndex)
-              // watch the funding tx transaction
-              val commitInput = localCommitTx.input
               val fundingSigned = FundingSigned(
                 channelId = channelId,
                 signature = localSigOfRemoteTx
               )
-              val commitments = Commitments(channelId, channelConfig, channelFeatures, localParams, remoteParams, channelFlags,
-                LocalCommit(0, localSpec, CommitTxAndRemoteSig(localCommitTx, remoteSig), htlcTxsAndRemoteSigs = Nil), RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint),
-                LocalChanges(Nil, Nil, Nil), RemoteChanges(Nil, Nil, Nil),
-                localNextHtlcId = 0L, remoteNextHtlcId = 0L,
-                originChannels = Map.empty,
-                remoteNextCommitInfo = Right(randomKey().publicKey), // we will receive their next per-commitment point in the next message, so we temporarily put a random byte array,
-                commitInput, ShaChain.init)
+              val commitment = Commitment(
+                localFundingStatus = SingleFundedUnconfirmedFundingTx(None),
+                remoteFundingStatus = RemoteFundingStatus.NotLocked,
+                localCommit = LocalCommit(0, localSpec, CommitTxAndRemoteSig(localCommitTx, remoteSig), htlcTxsAndRemoteSigs = Nil),
+                remoteCommit = RemoteCommit(0, remoteSpec, remoteCommitTx.tx.txid, remoteFirstPerCommitmentPoint),
+                nextRemoteCommit_opt = None)
+              val commitments = Commitments(
+                params = params.copy(channelId = channelId),
+                changes = CommitmentChanges.init(),
+                active = List(commitment),
+                remoteNextCommitInfo = Right(randomKey().publicKey), // we will receive their next per-commitment point in the next message, so we temporarily put a random byte array
+                remotePerCommitmentSecrets = ShaChain.init,
+                originChannels = Map.empty)
               peer ! ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId) // we notify the peer asap so it knows how to route messages
               txPublisher ! SetChannelId(remoteNodeId, channelId)
               context.system.eventStream.publish(ChannelIdAssigned(self, remoteNodeId, temporaryChannelId, channelId))
               context.system.eventStream.publish(ChannelSignatureReceived(self, commitments))
               // NB: we don't send a ChannelSignatureSent for the first commit
-              log.info(s"waiting for them to publish the funding tx for channelId=$channelId fundingTxid=${commitments.fundingTxId}")
-              watchFundingTx(commitments)
-              Funding.minDepthFundee(nodeParams.channelConf, commitments.localParams.initFeatures, fundingAmount) match {
-                case Some(fundingMinDepth) => blockchain ! WatchFundingConfirmed(self, commitments.fundingTxId, fundingMinDepth)
-                case None => blockchain ! WatchPublished(self, commitments.fundingTxId)
-              }
-              goto(WAIT_FOR_FUNDING_CONFIRMED) using DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments, None, nodeParams.currentBlockHeight, None, Right(fundingSigned)) storing() sending fundingSigned
+              log.info(s"waiting for them to publish the funding tx for channelId=$channelId fundingTxid=${commitment.fundingTxId}")
+              watchFundingConfirmed(commitment.fundingTxId, Funding.minDepthFundee(nodeParams.channelConf, params.localParams.initFeatures, fundingAmount))
+              goto(WAIT_FOR_FUNDING_CONFIRMED) using DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments, nodeParams.currentBlockHeight, None, Right(fundingSigned)) storing() sending fundingSigned
           }
       }
 
     case Event(c: CloseCommand, d: DATA_WAIT_FOR_FUNDING_CREATED) =>
-      channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelClosed(d.temporaryChannelId)))
-      handleFastClose(c, d.temporaryChannelId)
+      channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelClosed(d.channelId)))
+      handleFastClose(c, d.channelId)
 
     case Event(e: Error, d: DATA_WAIT_FOR_FUNDING_CREATED) => handleRemoteError(e, d)
 
@@ -308,39 +310,39 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
   })
 
   when(WAIT_FOR_FUNDING_SIGNED)(handleExceptions {
-    case Event(msg@FundingSigned(_, remoteSig, _), d@DATA_WAIT_FOR_FUNDING_SIGNED(channelId, localParams, remoteParams, fundingTx, fundingTxFee, localSpec, localCommitTx, remoteCommit, channelFlags, channelConfig, channelFeatures, fundingCreated)) =>
+    case Event(msg@FundingSigned(_, remoteSig, _), d@DATA_WAIT_FOR_FUNDING_SIGNED(params, fundingTx, fundingTxFee, localSpec, localCommitTx, remoteCommit, fundingCreated)) =>
       // we make sure that their sig checks out and that our first commit tx is spendable
-      val fundingPubKey = keyManager.fundingPublicKey(localParams.fundingKeyPath)
-      val localSigOfLocalTx = keyManager.sign(localCommitTx, fundingPubKey, TxOwner.Local, channelFeatures.commitmentFormat)
-      val signedLocalCommitTx = Transactions.addSigs(localCommitTx, fundingPubKey.publicKey, remoteParams.fundingPubKey, localSigOfLocalTx, remoteSig)
+      val fundingPubKey = keyManager.fundingPublicKey(params.localParams.fundingKeyPath)
+      val localSigOfLocalTx = keyManager.sign(localCommitTx, fundingPubKey, TxOwner.Local, params.channelFeatures.commitmentFormat)
+      val signedLocalCommitTx = Transactions.addSigs(localCommitTx, fundingPubKey.publicKey, params.remoteParams.fundingPubKey, localSigOfLocalTx, remoteSig)
       Transactions.checkSpendable(signedLocalCommitTx) match {
         case Failure(cause) =>
           // we rollback the funding tx, it will never be published
           wallet.rollback(fundingTx)
           channelOpenReplyToUser(Left(LocalError(cause)))
-          handleLocalError(InvalidCommitmentSignature(channelId, signedLocalCommitTx.tx.txid), d, Some(msg))
+          handleLocalError(InvalidCommitmentSignature(d.channelId, signedLocalCommitTx.tx.txid), d, Some(msg))
         case Success(_) =>
-          val commitInput = localCommitTx.input
-          val commitments = Commitments(channelId, channelConfig, channelFeatures, localParams, remoteParams, channelFlags,
-            LocalCommit(0, localSpec, CommitTxAndRemoteSig(localCommitTx, remoteSig), htlcTxsAndRemoteSigs = Nil), remoteCommit,
-            LocalChanges(Nil, Nil, Nil), RemoteChanges(Nil, Nil, Nil),
-            localNextHtlcId = 0L, remoteNextHtlcId = 0L,
-            originChannels = Map.empty,
+          val commitment = Commitment(
+            localFundingStatus = SingleFundedUnconfirmedFundingTx(Some(fundingTx)),
+            remoteFundingStatus = RemoteFundingStatus.NotLocked,
+            localCommit = LocalCommit(0, localSpec, CommitTxAndRemoteSig(localCommitTx, remoteSig), htlcTxsAndRemoteSigs = Nil),
+            remoteCommit = remoteCommit,
+            nextRemoteCommit_opt = None
+          )
+          val commitments = Commitments(
+            params = params,
+            changes = CommitmentChanges.init(),
+            active = List(commitment),
             remoteNextCommitInfo = Right(randomKey().publicKey), // we will receive their next per-commitment point in the next message, so we temporarily put a random byte array
-            commitInput, ShaChain.init)
+            remotePerCommitmentSecrets = ShaChain.init,
+            originChannels = Map.empty)
           val blockHeight = nodeParams.currentBlockHeight
           context.system.eventStream.publish(ChannelSignatureReceived(self, commitments))
-          log.info(s"publishing funding tx for channelId=$channelId fundingTxid=${commitments.fundingTxId}")
-          watchFundingTx(commitments)
-          Funding.minDepthFunder(commitments.localParams.initFeatures) match {
-            case Some(fundingMinDepth) => blockchain ! WatchFundingConfirmed(self, commitments.fundingTxId, fundingMinDepth)
-            // When using 0-conf, we make sure that the transaction was successfully published, otherwise there is a risk
-            // of accidentally double-spending it later (e.g. restarting bitcoind would remove the utxo locks).
-            case None => blockchain ! WatchPublished(self, commitments.fundingTxId)
-          }
+          log.info(s"publishing funding tx fundingTxid=${commitment.fundingTxId}")
+          watchFundingConfirmed(commitment.fundingTxId, Funding.minDepthFunder(params.localParams.initFeatures))
           // we will publish the funding tx only after the channel state has been written to disk because we want to
           // make sure we first persist the commitment that returns back the funds to us in case of problem
-          goto(WAIT_FOR_FUNDING_CONFIRMED) using DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments, Some(fundingTx), blockHeight, None, Left(fundingCreated)) storing() calling publishFundingTx(commitments, fundingTx, fundingTxFee)
+          goto(WAIT_FOR_FUNDING_CONFIRMED) using DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments, blockHeight, None, Left(fundingCreated)) storing() calling publishFundingTx(d.channelId, fundingTx, fundingTxFee)
       }
 
     case Event(c: CloseCommand, d: DATA_WAIT_FOR_FUNDING_SIGNED) =>
@@ -370,28 +372,45 @@ trait ChannelOpenSingleFunded extends SingleFundingHandlers with ErrorHandlers {
 
   when(WAIT_FOR_FUNDING_CONFIRMED)(handleExceptions {
     case Event(remoteChannelReady: ChannelReady, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) =>
-      if (remoteChannelReady.alias_opt.isDefined && d.commitments.localParams.isInitiator) {
+      if (remoteChannelReady.alias_opt.isDefined && d.commitments.params.localParams.isInitiator) {
         log.info("this channel isn't zero-conf, but we are funder and they sent an early channel_ready with an alias: no need to wait for confirmations")
         // NB: we will receive a WatchFundingConfirmedTriggered later that will simply be ignored
-        blockchain ! WatchPublished(self, d.commitments.fundingTxId)
+        blockchain ! WatchPublished(self, d.commitments.latest.fundingTxId)
       }
       log.debug("received their channel_ready, deferring message")
       stay() using d.copy(deferred = Some(remoteChannelReady)) // no need to store, they will re-send if we get disconnected
 
-    case Event(WatchPublishedTriggered(fundingTx), d: DATA_WAIT_FOR_FUNDING_CONFIRMED) =>
-      log.info("funding txid={} was successfully published for zero-conf channelId={}", fundingTx.txid, d.channelId)
-      acceptSingleFundingTx(d, fundingTx, RealScidStatus.Unknown)
+    case Event(w: WatchPublishedTriggered, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) =>
+      val fundingStatus = LocalFundingStatus.ZeroconfPublishedFundingTx(w.tx)
+      d.commitments.updateLocalFundingStatus(w.tx.txid, fundingStatus) match {
+        case Right((commitments1, _)) =>
+          log.info("funding txid={} was successfully published for zero-conf channelId={}", w.tx.txid, d.channelId)
+          // we still watch the funding tx for confirmation even if we can use the zero-conf channel right away
+          watchFundingConfirmed(w.tx.txid, Some(nodeParams.channelConf.minDepthBlocks))
+          val realScidStatus = RealScidStatus.Unknown
+          val shortIds = createShortIds(d.channelId, realScidStatus)
+          val channelReady = createChannelReady(shortIds, d.commitments.params)
+          d.deferred.foreach(self ! _)
+          goto(WAIT_FOR_CHANNEL_READY) using DATA_WAIT_FOR_CHANNEL_READY(commitments1, shortIds) storing() sending channelReady
+        case Left(_) => stay()
+      }
 
-    case Event(WatchFundingConfirmedTriggered(blockHeight, txIndex, fundingTx), d: DATA_WAIT_FOR_FUNDING_CONFIRMED) =>
-      log.info(s"channelId=${d.channelId} was confirmed at blockHeight=$blockHeight txIndex=$txIndex")
-      val realScidStatus = RealScidStatus.Temporary(RealShortChannelId(blockHeight, txIndex, d.commitments.commitInput.outPoint.index.toInt))
-      acceptSingleFundingTx(d, fundingTx, realScidStatus)
+    case Event(w: WatchFundingConfirmedTriggered, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) =>
+      acceptFundingTxConfirmed(w, d) match {
+        case Right((commitments1, _)) =>
+          val realScidStatus = RealScidStatus.Temporary(RealShortChannelId(w.blockHeight, w.txIndex, d.commitments.latest.commitInput.outPoint.index.toInt))
+          val shortIds = createShortIds(d.channelId, realScidStatus)
+          val channelReady = createChannelReady(shortIds, d.commitments.params)
+          d.deferred.foreach(self ! _)
+          goto(WAIT_FOR_CHANNEL_READY) using DATA_WAIT_FOR_CHANNEL_READY(commitments1, shortIds) storing() sending channelReady
+        case Left(_) => stay()
+      }
 
     case Event(remoteAnnSigs: AnnouncementSignatures, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) if d.commitments.announceChannel =>
       delayEarlyAnnouncementSigs(remoteAnnSigs)
       stay()
 
-    case Event(getTxResponse: GetTxWithMetaResponse, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) if getTxResponse.txid == d.commitments.fundingTxId => handleGetFundingTx(getTxResponse, d.waitingSince, d.fundingTx_opt)
+    case Event(getTxResponse: GetTxWithMetaResponse, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) if getTxResponse.txid == d.commitments.latest.fundingTxId => handleGetFundingTx(getTxResponse, d.waitingSince, d.fundingTx_opt)
 
     case Event(BITCOIN_FUNDING_PUBLISH_FAILED, d: DATA_WAIT_FOR_FUNDING_CONFIRMED) => handleFundingPublishFailed(d)
 

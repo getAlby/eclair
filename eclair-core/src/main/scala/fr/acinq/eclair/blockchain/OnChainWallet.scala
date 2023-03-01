@@ -17,7 +17,7 @@
 package fr.acinq.eclair.blockchain
 
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
-import fr.acinq.bitcoin.scalacompat.{ByteVector32, Satoshi, Transaction}
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, OutPoint, Satoshi, Transaction}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
 import scodec.bits.ByteVector
 
@@ -33,7 +33,7 @@ trait OnChainChannelFunder {
   import OnChainWallet._
 
   /** Fund the provided transaction by adding inputs (and a change output if necessary). */
-  def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean)(implicit ec: ExecutionContext): Future[FundTransactionResponse]
+  def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean, externalInputsWeight: Map[OutPoint, Long] = Map.empty)(implicit ec: ExecutionContext): Future[FundTransactionResponse]
 
   /** Sign the wallet inputs of the provided transaction. */
   def signTransaction(tx: Transaction, allowIncomplete: Boolean)(implicit ec: ExecutionContext): Future[SignTransactionResponse]
@@ -87,6 +87,14 @@ trait OnChainAddressGenerator {
   /** Generate a p2wpkh wallet address and return the corresponding public key. */
   def getP2wpkhPubkey()(implicit ec: ExecutionContext): Future[PublicKey]
 
+}
+
+trait OnchainPubkeyCache {
+
+  /**
+   * @param renew applies after requesting the current pubkey, and is asynchronous
+   */
+  def getP2wpkhPubkey(renew: Boolean = true): PublicKey
 }
 
 /** This trait lets users check the wallet's on-chain balance. */

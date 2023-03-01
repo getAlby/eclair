@@ -19,7 +19,7 @@ package fr.acinq.eclair.wire.protocol
 import com.google.common.base.Charsets
 import com.google.common.net.InetAddresses
 import fr.acinq.bitcoin.scalacompat.Crypto.{PrivateKey, PublicKey}
-import fr.acinq.bitcoin.scalacompat.{ByteVector32, ByteVector64, Satoshi, SatoshiLong, ScriptWitness, Transaction}
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, ByteVector64, OutPoint, Satoshi, SatoshiLong, ScriptWitness, Transaction}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
 import fr.acinq.eclair.channel.{ChannelFlags, ChannelType}
 import fr.acinq.eclair.payment.relay.Relayer
@@ -84,10 +84,18 @@ case class Pong(data: ByteVector, tlvStream: TlvStream[PongTlv] = TlvStream.empt
 
 case class TxAddInput(channelId: ByteVector32,
                       serialId: UInt64,
-                      previousTx: Transaction,
+                      previousTx_opt: Option[Transaction],
                       previousTxOutput: Long,
                       sequence: Long,
-                      tlvStream: TlvStream[TxAddInputTlv] = TlvStream.empty) extends InteractiveTxConstructionMessage with HasChannelId with HasSerialId
+                      tlvStream: TlvStream[TxAddInputTlv] = TlvStream.empty) extends InteractiveTxConstructionMessage with HasChannelId with HasSerialId {
+  val sharedInput_opt: Option[OutPoint] = tlvStream.get[TxAddInputTlv.SharedInputTxId].map(i => OutPoint(i.txid.reverse, previousTxOutput))
+}
+
+object TxAddInput {
+  def apply(channelId: ByteVector32, serialId: UInt64, sharedInput: OutPoint, sequence: Long): TxAddInput = {
+    TxAddInput(channelId, serialId, None, sharedInput.index, sequence, TlvStream(TxAddInputTlv.SharedInputTxId(sharedInput.txid)))
+  }
+}
 
 case class TxAddOutput(channelId: ByteVector32,
                        serialId: UInt64,
@@ -111,10 +119,13 @@ case class TxSignatures(channelId: ByteVector32,
                         witnesses: Seq[ScriptWitness],
                         tlvStream: TlvStream[TxSignaturesTlv] = TlvStream.empty) extends InteractiveTxMessage with HasChannelId {
   val txId: ByteVector32 = txHash.reverse
+  val previousFundingTxSig_opt: Option[ByteVector64] = tlvStream.get[TxSignaturesTlv.PreviousFundingTxSig].map(_.sig)
 }
 
 object TxSignatures {
-  def apply(channelId: ByteVector32, tx: Transaction, witnesses: Seq[ScriptWitness]): TxSignatures = TxSignatures(channelId, tx.hash, witnesses)
+  def apply(channelId: ByteVector32, tx: Transaction, witnesses: Seq[ScriptWitness], previousFundingSig_opt: Option[ByteVector64]): TxSignatures = {
+    TxSignatures(channelId, tx.hash, witnesses, TlvStream(previousFundingSig_opt.map(TxSignaturesTlv.PreviousFundingTxSig).toSet[TxSignaturesTlv]))
+  }
 }
 
 case class TxInitRbf(channelId: ByteVector32,
@@ -216,6 +227,7 @@ case class OpenDualFundedChannel(chainHash: ByteVector32,
                                  delayedPaymentBasepoint: PublicKey,
                                  htlcBasepoint: PublicKey,
                                  firstPerCommitmentPoint: PublicKey,
+                                 secondPerCommitmentPoint: PublicKey,
                                  channelFlags: ChannelFlags,
                                  tlvStream: TlvStream[OpenDualFundedChannelTlv] = TlvStream.empty) extends ChannelMessage with HasTemporaryChannelId with HasChainHash {
   val upfrontShutdownScript_opt: Option[ByteVector] = tlvStream.get[ChannelTlv.UpfrontShutdownScriptTlv].map(_.script)
@@ -239,6 +251,7 @@ case class AcceptDualFundedChannel(temporaryChannelId: ByteVector32,
                                    delayedPaymentBasepoint: PublicKey,
                                    htlcBasepoint: PublicKey,
                                    firstPerCommitmentPoint: PublicKey,
+                                   secondPerCommitmentPoint: PublicKey,
                                    tlvStream: TlvStream[AcceptDualFundedChannelTlv] = TlvStream.empty) extends ChannelMessage with HasTemporaryChannelId {
   val upfrontShutdownScript_opt: Option[ByteVector] = tlvStream.get[ChannelTlv.UpfrontShutdownScriptTlv].map(_.script)
   val channelType_opt: Option[ChannelType] = tlvStream.get[ChannelTlv.ChannelTypeTlv].map(_.channelType)
@@ -291,8 +304,8 @@ object UpdateAddHtlc {
             cltvExpiry: CltvExpiry,
             onionRoutingPacket: OnionRoutingPacket,
             blinding_opt: Option[PublicKey]): UpdateAddHtlc = {
-    val tlvs = Seq(blinding_opt.map(UpdateAddHtlcTlv.BlindingPoint)).flatten
-    UpdateAddHtlc(channelId, id, amountMsat, paymentHash, cltvExpiry, onionRoutingPacket, TlvStream[UpdateAddHtlcTlv](tlvs))
+    val tlvs = blinding_opt.map(UpdateAddHtlcTlv.BlindingPoint).toSet[UpdateAddHtlcTlv]
+    UpdateAddHtlc(channelId, id, amountMsat, paymentHash, cltvExpiry, onionRoutingPacket, TlvStream(tlvs))
   }
 }
 
@@ -315,7 +328,9 @@ case class UpdateFailMalformedHtlc(channelId: ByteVector32,
 case class CommitSig(channelId: ByteVector32,
                      signature: ByteVector64,
                      htlcSignatures: List[ByteVector64],
-                     tlvStream: TlvStream[CommitSigTlv] = TlvStream.empty) extends HtlcMessage with HasChannelId
+                     tlvStream: TlvStream[CommitSigTlv] = TlvStream.empty) extends HtlcMessage with HasChannelId {
+  val fundingTxId_opt: Option[ByteVector32] = tlvStream.get[CommitSigTlv.FundingTxIdTlv].map(_.txId)
+}
 
 case class RevokeAndAck(channelId: ByteVector32,
                         perCommitmentSecret: PrivateKey,
@@ -492,7 +507,7 @@ object ReplyChannelRange {
             checksums: Option[ReplyChannelRangeTlv.EncodedChecksums]): ReplyChannelRange = {
     timestamps.foreach(ts => require(ts.timestamps.length == shortChannelIds.array.length))
     checksums.foreach(cs => require(cs.checksums.length == shortChannelIds.array.length))
-    new ReplyChannelRange(chainHash, firstBlock, numberOfBlocks, syncComplete, shortChannelIds, TlvStream(timestamps.toList ::: checksums.toList))
+    new ReplyChannelRange(chainHash, firstBlock, numberOfBlocks, syncComplete, shortChannelIds, TlvStream(Set(timestamps, checksums).flatten[ReplyChannelRangeTlv]))
   }
 }
 

@@ -20,12 +20,13 @@ import akka.actor.{ActorRef, PossiblyHarmful, typed}
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
 import fr.acinq.bitcoin.scalacompat.{ByteVector32, DeterministicWallet, OutPoint, Satoshi, Transaction}
 import fr.acinq.eclair.blockchain.fee.FeeratePerKw
+import fr.acinq.eclair.channel.LocalFundingStatus.DualFundedUnconfirmedFundingTx
 import fr.acinq.eclair.channel.fund.InteractiveTxBuilder
 import fr.acinq.eclair.channel.fund.InteractiveTxBuilder._
 import fr.acinq.eclair.payment.OutgoingPaymentPacket.Upstream
 import fr.acinq.eclair.transactions.CommitmentSpec
 import fr.acinq.eclair.transactions.Transactions._
-import fr.acinq.eclair.wire.protocol.{AcceptChannel, ChannelAnnouncement, ChannelReady, ChannelReestablish, ChannelUpdate, ClosingSigned, FailureMessage, FundingCreated, FundingSigned, Init, OnionRoutingPacket, OpenChannel, OpenDualFundedChannel, Shutdown, UpdateAddHtlc, UpdateFailHtlc, UpdateFailMalformedHtlc, UpdateFulfillHtlc}
+import fr.acinq.eclair.wire.protocol.{ChannelAnnouncement, ChannelReady, ChannelReestablish, ChannelUpdate, ClosingSigned, FailureMessage, FundingCreated, FundingSigned, Init, OnionRoutingPacket, OpenChannel, OpenDualFundedChannel, Shutdown, UpdateAddHtlc, UpdateFailHtlc, UpdateFailMalformedHtlc, UpdateFulfillHtlc}
 import fr.acinq.eclair.{Alias, BlockHeight, CltvExpiry, CltvExpiryDelta, Features, InitFeature, MilliSatoshi, RealShortChannelId, UInt64}
 import scodec.bits.ByteVector
 
@@ -406,24 +407,39 @@ object RealScidStatus {
  */
 case class ShortIds(real: RealScidStatus, localAlias: Alias, remoteAlias_opt: Option[Alias])
 
-sealed trait UnconfirmedFundingTx {
-  def signedTx_opt: Option[Transaction]
-}
-case class SingleFundedUnconfirmedFundingTx(signedTx: Transaction) extends UnconfirmedFundingTx {
-  override val signedTx_opt: Option[Transaction] = Some(signedTx)
-}
-case class DualFundedUnconfirmedFundingTx(sharedTx: SignedSharedTransaction) extends UnconfirmedFundingTx {
-  override def signedTx_opt: Option[Transaction] = sharedTx.signedTx_opt
+sealed trait LocalFundingStatus { def signedTx_opt: Option[Transaction] }
+object LocalFundingStatus {
+  sealed trait UnconfirmedFundingTx extends LocalFundingStatus
+  /**
+   * In single-funding, fundees only know the funding txid.
+   * We also set an empty funding tx in the backward compatibility context, for channels that were in a state where we
+   * didn't keep the funding tx at all, even as funder (e.g. NORMAL). However, right after restoring those channels we
+   * retrieve the funding tx and update the funding status immediately.
+   */
+  case class SingleFundedUnconfirmedFundingTx(signedTx_opt: Option[Transaction]) extends UnconfirmedFundingTx
+  case class DualFundedUnconfirmedFundingTx(sharedTx: SignedSharedTransaction, createdAt: BlockHeight, fundingParams: InteractiveTxParams) extends UnconfirmedFundingTx {
+    override def signedTx_opt: Option[Transaction] = sharedTx.signedTx_opt
+  }
+  case class ZeroconfPublishedFundingTx(tx: Transaction) extends UnconfirmedFundingTx {
+    override val signedTx_opt: Option[Transaction] = Some(tx)
+  }
+  case class ConfirmedFundingTx(tx: Transaction) extends LocalFundingStatus {
+    override val signedTx_opt: Option[Transaction] = Some(tx)
+  }
 }
 
-/** Once a dual funding tx has been signed, we must remember the associated commitments. */
-case class DualFundingTx(fundingTx: SignedSharedTransaction, commitments: Commitments)
+sealed trait RemoteFundingStatus
+object RemoteFundingStatus {
+  case object NotLocked extends RemoteFundingStatus
+  case object Locked extends RemoteFundingStatus
+}
 
 sealed trait RbfStatus
 object RbfStatus {
   case object NoRbf extends RbfStatus
   case class RbfRequested(cmd: CMD_BUMP_FUNDING_FEE) extends RbfStatus
   case class RbfInProgress(rbf: typed.ActorRef[InteractiveTxBuilder.Command]) extends RbfStatus
+  case object RbfAborted extends RbfStatus
 }
 
 sealed trait ChannelData extends PossiblyHarmful {
@@ -447,51 +463,37 @@ final case class DATA_WAIT_FOR_OPEN_CHANNEL(initFundee: INPUT_INIT_CHANNEL_NON_I
 final case class DATA_WAIT_FOR_ACCEPT_CHANNEL(initFunder: INPUT_INIT_CHANNEL_INITIATOR, lastSent: OpenChannel) extends TransientChannelData {
   val channelId: ByteVector32 = initFunder.temporaryChannelId
 }
-final case class DATA_WAIT_FOR_FUNDING_INTERNAL(temporaryChannelId: ByteVector32,
-                                                localParams: LocalParams,
-                                                remoteParams: RemoteParams,
+final case class DATA_WAIT_FOR_FUNDING_INTERNAL(params: ChannelParams,
                                                 fundingAmount: Satoshi,
                                                 pushAmount: MilliSatoshi,
                                                 commitTxFeerate: FeeratePerKw,
-                                                remoteFirstPerCommitmentPoint: PublicKey,
-                                                channelConfig: ChannelConfig,
-                                                channelFeatures: ChannelFeatures,
-                                                lastSent: OpenChannel) extends TransientChannelData {
-  val channelId: ByteVector32 = temporaryChannelId
+                                                remoteFirstPerCommitmentPoint: PublicKey) extends TransientChannelData {
+  val channelId: ByteVector32 = params.channelId
 }
-final case class DATA_WAIT_FOR_FUNDING_CREATED(temporaryChannelId: ByteVector32,
-                                               localParams: LocalParams,
-                                               remoteParams: RemoteParams,
+final case class DATA_WAIT_FOR_FUNDING_CREATED(params: ChannelParams,
                                                fundingAmount: Satoshi,
                                                pushAmount: MilliSatoshi,
                                                commitTxFeerate: FeeratePerKw,
-                                               remoteFirstPerCommitmentPoint: PublicKey,
-                                               channelFlags: ChannelFlags,
-                                               channelConfig: ChannelConfig,
-                                               channelFeatures: ChannelFeatures,
-                                               lastSent: AcceptChannel) extends TransientChannelData {
-  val channelId: ByteVector32 = temporaryChannelId
+                                               remoteFirstPerCommitmentPoint: PublicKey) extends TransientChannelData {
+  val channelId: ByteVector32 = params.channelId
 }
-final case class DATA_WAIT_FOR_FUNDING_SIGNED(channelId: ByteVector32,
-                                              localParams: LocalParams,
-                                              remoteParams: RemoteParams,
+final case class DATA_WAIT_FOR_FUNDING_SIGNED(params: ChannelParams,
                                               fundingTx: Transaction,
                                               fundingTxFee: Satoshi,
                                               localSpec: CommitmentSpec,
                                               localCommitTx: CommitTx,
                                               remoteCommit: RemoteCommit,
-                                              channelFlags: ChannelFlags,
-                                              channelConfig: ChannelConfig,
-                                              channelFeatures: ChannelFeatures,
-                                              lastSent: FundingCreated) extends TransientChannelData
+                                              lastSent: FundingCreated) extends TransientChannelData {
+  val channelId: ByteVector32 = params.channelId
+}
 final case class DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments: Commitments,
-                                                 fundingTx_opt: Option[Transaction],
                                                  waitingSince: BlockHeight, // how long have we been waiting for the funding tx to confirm
                                                  deferred: Option[ChannelReady],
-                                                 lastSent: Either[FundingCreated, FundingSigned]) extends PersistentChannelData
+                                                 lastSent: Either[FundingCreated, FundingSigned]) extends PersistentChannelData {
+  def fundingTx_opt: Option[Transaction] = commitments.latest.localFundingStatus.signedTx_opt
+}
 final case class DATA_WAIT_FOR_CHANNEL_READY(commitments: Commitments,
-                                             shortIds: ShortIds,
-                                             lastSent: ChannelReady) extends PersistentChannelData
+                                             shortIds: ShortIds) extends PersistentChannelData
 
 final case class DATA_WAIT_FOR_OPEN_DUAL_FUNDED_CHANNEL(init: INPUT_INIT_CHANNEL_NON_INITIATOR) extends TransientChannelData {
   val channelId: ByteVector32 = init.temporaryChannelId
@@ -500,23 +502,25 @@ final case class DATA_WAIT_FOR_ACCEPT_DUAL_FUNDED_CHANNEL(init: INPUT_INIT_CHANN
   val channelId: ByteVector32 = lastSent.temporaryChannelId
 }
 final case class DATA_WAIT_FOR_DUAL_FUNDING_CREATED(channelId: ByteVector32,
+                                                    channelParams: ChannelParams,
+                                                    secondRemotePerCommitmentPoint: PublicKey,
                                                     localPushAmount: MilliSatoshi,
                                                     remotePushAmount: MilliSatoshi,
                                                     txBuilder: typed.ActorRef[InteractiveTxBuilder.Command],
                                                     deferred: Option[ChannelReady]) extends TransientChannelData
 final case class DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED(commitments: Commitments,
-                                                      fundingTx: SignedSharedTransaction,
-                                                      fundingParams: InteractiveTxParams,
                                                       localPushAmount: MilliSatoshi,
                                                       remotePushAmount: MilliSatoshi,
-                                                      previousFundingTxs: List[DualFundingTx],
                                                       waitingSince: BlockHeight, // how long have we been waiting for a funding tx to confirm
                                                       lastChecked: BlockHeight, // last time we checked if the channel was double-spent
                                                       rbfStatus: RbfStatus,
-                                                      deferred: Option[ChannelReady]) extends PersistentChannelData
+                                                      deferred: Option[ChannelReady]) extends PersistentChannelData {
+  def allFundingTxs: Seq[DualFundedUnconfirmedFundingTx] = commitments.active.map(_.localFundingStatus).collect { case fundingTx: DualFundedUnconfirmedFundingTx => fundingTx }
+  def latestFundingTx: DualFundedUnconfirmedFundingTx = commitments.latest.localFundingStatus.asInstanceOf[DualFundedUnconfirmedFundingTx]
+  def previousFundingTxs: Seq[DualFundedUnconfirmedFundingTx] = allFundingTxs diff Seq(latestFundingTx)
+}
 final case class DATA_WAIT_FOR_DUAL_FUNDING_READY(commitments: Commitments,
-                                                  shortIds: ShortIds,
-                                                  lastSent: ChannelReady) extends PersistentChannelData
+                                                  shortIds: ShortIds) extends PersistentChannelData
 
 final case class DATA_NORMAL(commitments: Commitments,
                              shortIds: ShortIds,
@@ -531,12 +535,11 @@ final case class DATA_NEGOTIATING(commitments: Commitments,
                                   closingTxProposed: List[List[ClosingTxProposed]], // one list for every negotiation (there can be several in case of disconnection)
                                   bestUnpublishedClosingTx_opt: Option[ClosingTx]) extends PersistentChannelData {
   require(closingTxProposed.nonEmpty, "there must always be a list for the current negotiation")
-  require(!commitments.localParams.isInitiator || closingTxProposed.forall(_.nonEmpty), "initiator must have at least one closing signature for every negotiation attempt because it initiates the closing")
+  require(!commitments.params.localParams.isInitiator || closingTxProposed.forall(_.nonEmpty), "initiator must have at least one closing signature for every negotiation attempt because it initiates the closing")
 }
 final case class DATA_CLOSING(commitments: Commitments,
-                              fundingTx: Option[UnconfirmedFundingTx],
                               waitingSince: BlockHeight, // how long since we initiated the closing
-                              alternativeCommitments: List[DualFundingTx], // commitments we signed that spend a different funding output
+                              finalScriptPubKey: ByteVector, // where to send all on-chain funds
                               mutualCloseProposed: List[ClosingTx], // all exchanged closing sigs are flattened, we use this only to keep track of what publishable tx they have
                               mutualClosePublished: List[ClosingTx] = Nil,
                               localCommitPublished: Option[LocalCommitPublished] = None,
@@ -564,7 +567,7 @@ case class LocalParams(nodeId: PublicKey,
                        toSelfDelay: CltvExpiryDelta,
                        maxAcceptedHtlcs: Int,
                        isInitiator: Boolean,
-                       defaultFinalScriptPubKey: ByteVector,
+                       upfrontShutdownScript_opt: Option[ByteVector],
                        walletStaticPaymentBasepoint: Option[PublicKey],
                        initFeatures: Features[InitFeature])
 
@@ -584,7 +587,7 @@ case class RemoteParams(nodeId: PublicKey,
                         delayedPaymentBasepoint: PublicKey,
                         htlcBasepoint: PublicKey,
                         initFeatures: Features[InitFeature],
-                        shutdownScript: Option[ByteVector])
+                        upfrontShutdownScript_opt: Option[ByteVector])
 
 case class ChannelFlags(announceChannel: Boolean) {
   override def toString: String = s"ChannelFlags(announceChannel=$announceChannel)"

@@ -16,10 +16,12 @@
 
 package fr.acinq.eclair.wire.internal.channel.version3
 
+import com.softwaremill.quicklens.{ModifyPimp, QuicklensAt}
 import fr.acinq.bitcoin.scalacompat.DeterministicWallet.KeyPath
 import fr.acinq.bitcoin.scalacompat.{OutPoint, Transaction, TxOut}
-import fr.acinq.eclair.channel.fund.InteractiveTxBuilder._
+import fr.acinq.eclair.channel.LocalFundingStatus._
 import fr.acinq.eclair.channel._
+import fr.acinq.eclair.channel.fund.InteractiveTxBuilder._
 import fr.acinq.eclair.crypto.ShaChain
 import fr.acinq.eclair.transactions.Transactions._
 import fr.acinq.eclair.transactions.{CommitmentSpec, DirectedHtlc, IncomingHtlc, OutgoingHtlc}
@@ -29,7 +31,7 @@ import fr.acinq.eclair.wire.protocol.UpdateMessage
 import fr.acinq.eclair.{Alias, BlockHeight, FeatureSupport, Features, PermanentChannelFeature}
 import scodec.bits.{BitVector, ByteVector}
 import scodec.codecs._
-import scodec.{Attempt, Codec}
+import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
 
 private[channel] object ChannelCodecs3 {
@@ -71,7 +73,7 @@ private[channel] object ChannelCodecs3 {
         ("toSelfDelay" | cltvExpiryDelta) ::
         ("maxAcceptedHtlcs" | uint16) ::
         ("isInitiator" | bool8) ::
-        ("defaultFinalScriptPubKey" | lengthDelimited(bytes)) ::
+        ("upfrontShutdownScript_opt" | lengthDelimited(bytes).map(Option(_)).decodeOnly) ::
         ("walletStaticPaymentBasepoint" | optional(provide(channelFeatures.paysDirectlyToWallet), publicKey)) ::
         ("features" | combinedFeaturesCodec)).as[LocalParams]
 
@@ -222,11 +224,11 @@ private[channel] object ChannelCodecs3 {
         ("acked" | listOfN(uint16, updateMessageCodec)) ::
         ("signed" | listOfN(uint16, updateMessageCodec))).as[RemoteChanges]
 
-    val waitingForRevocationCodec: Codec[WaitingForRevocation] = (
+    val waitingForRevocationCodec: Codec[ChannelTypes3.WaitingForRevocation] = (
       ("nextRemoteCommit" | remoteCommitCodec) ::
         ("sent" | lengthDelimited(commitSigCodec)) ::
         ("sentAfterLocalCommitIndex" | uint64overflow) ::
-        ("reSignAsap" | ignore(8))).as[WaitingForRevocation]
+        ("reSignAsap" | ignore(8))).as[ChannelTypes3.WaitingForRevocation]
 
     val localColdCodec: Codec[Origin.LocalCold] = ("id" | uuid).as[Origin.LocalCold]
 
@@ -270,55 +272,16 @@ private[channel] object ChannelCodecs3 {
             ("remoteNextHtlcId" | uint64overflow) ::
             ("originChannels" | originsMapCodec) ::
             ("remoteNextCommitInfo" | either(bool8, waitingForRevocationCodec, publicKey)) ::
-            ("commitInput" | inputInfoCodec) ::
+            ("commitInput" | inputInfoCodec.map(_ => ()).decodeOnly) ::
+            ("fundingTxStatus" | provide(SingleFundedUnconfirmedFundingTx(None)).upcast[LocalFundingStatus]) ::
+            ("remoteFundingTxStatus" | provide(RemoteFundingStatus.Locked).upcast[RemoteFundingStatus]) ::
             ("remotePerCommitmentSecrets" | byteAligned(ShaChain.shaChainCodec))
-        })).as[Commitments]
+        })).as[ChannelTypes3.Commitments].decodeOnly.map[Commitments](_.migrate()).decodeOnly
 
-    private val remoteTxAddInputCodec: Codec[RemoteTxAddInput] = (
-      ("serialId" | uint64) ::
-        ("outPoint" | outPointCodec) ::
-        ("txOut" | txOutCodec) ::
-        ("sequence" | uint32)).as[RemoteTxAddInput]
+    /** Once a dual funding tx has been signed, we must remember the associated commitments. */
+    case class DualFundingTx(fundingTx: SignedSharedTransaction, commitments: ChannelTypes3.Commitments)
 
-    private val remoteTxAddOutputCodec: Codec[RemoteTxAddOutput] = (
-      ("serialId" | uint64) ::
-        ("amount" | satoshi) ::
-        ("scriptPubKey" | lengthDelimited(bytes))).as[RemoteTxAddOutput]
-
-    private val sharedTransactionCodec: Codec[SharedTransaction] = (
-      ("localInputs" | listOfN(uint16, lengthDelimited(txAddInputCodec))) ::
-        ("remoteInputs" | listOfN(uint16, remoteTxAddInputCodec)) ::
-        ("localOutputs" | listOfN(uint16, lengthDelimited(txAddOutputCodec))) ::
-        ("remoteOutputs" | listOfN(uint16, remoteTxAddOutputCodec)) ::
-        ("lockTime" | uint32)).as[SharedTransaction]
-
-    private val partiallySignedSharedTransactionCodec: Codec[PartiallySignedSharedTransaction] = (
-      ("sharedTx" | sharedTransactionCodec) ::
-        ("localSigs" | lengthDelimited(txSignaturesCodec))).as[PartiallySignedSharedTransaction]
-
-    private val fullySignedSharedTransactionCodec: Codec[FullySignedSharedTransaction] = (
-      ("sharedTx" | sharedTransactionCodec) ::
-        ("localSigs" | lengthDelimited(txSignaturesCodec)) ::
-        ("remoteSigs" | lengthDelimited(txSignaturesCodec))).as[FullySignedSharedTransaction]
-
-    private val signedSharedTransactionCodec: Codec[SignedSharedTransaction] = discriminated[SignedSharedTransaction].by(uint16)
-      .typecase(0x01, partiallySignedSharedTransactionCodec)
-      .typecase(0x02, fullySignedSharedTransactionCodec)
-
-    private val dualFundingTxCodec: Codec[DualFundingTx] = (
-      ("fundingTx" | signedSharedTransactionCodec) ::
-        ("commitments" | commitmentsCodec)).as[DualFundingTx]
-
-    private val fundingParamsCodec: Codec[InteractiveTxParams] = (
-      ("channelId" | bytes32) ::
-        ("isInitiator" | bool8) ::
-        ("localAmount" | satoshi) ::
-        ("remoteAmount" | satoshi) ::
-        ("fundingPubkeyScript" | lengthDelimited(bytes)) ::
-        ("lockTime" | uint32) ::
-        ("dustLimit" | satoshi) ::
-        ("targetFeerate" | feeratePerKw) ::
-        ("requireConfirmedInputs" | (("forLocal" | bool8) :: ("forRemote" | bool8)).as[RequireConfirmedInputs])).as[InteractiveTxParams]
+    private val dualFundingTxCodec: Codec[DualFundingTx] = fail[DualFundingTx](Err("you have been running dual funding before it was officially released! contact developers"))
 
     val closingFeeratesCodec: Codec[ClosingFeerates] = (
       ("preferred" | feeratePerKw) ::
@@ -355,40 +318,32 @@ private[channel] object ChannelCodecs3 {
     val DATA_WAIT_FOR_FUNDING_CONFIRMED_00_Codec: Codec[DATA_WAIT_FOR_FUNDING_CONFIRMED] = (
       ("commitments" | commitmentsCodec) ::
         ("fundingTx_opt" | optional(bool8, txCodec)) ::
-        // TODO: next time we define a new channel codec version, we should use the blockHeight codec here (32 bytes)
         ("waitingSince" | int64.as[BlockHeight]) ::
         ("deferred" | optional(bool8, lengthDelimited(channelReadyCodec))) ::
-        ("lastSent" | either(bool8, lengthDelimited(fundingCreatedCodec), lengthDelimited(fundingSignedCodec)))).as[DATA_WAIT_FOR_FUNDING_CONFIRMED]
+        ("lastSent" | either(bool8, lengthDelimited(fundingCreatedCodec), lengthDelimited(fundingSignedCodec)))).map {
+      case commitments :: fundingTx :: waitingSince :: deferred :: lastSent :: HNil =>
+        val commitments1 = commitments.modify(_.active.at(0).localFundingStatus).setTo(SingleFundedUnconfirmedFundingTx(fundingTx))
+        DATA_WAIT_FOR_FUNDING_CONFIRMED(commitments1, waitingSince, deferred, lastSent)
+    }.decodeOnly
 
     val DATA_WAIT_FOR_CHANNEL_READY_01_Codec: Codec[DATA_WAIT_FOR_CHANNEL_READY] = (
       ("commitments" | commitmentsCodec) ::
         ("shortChannelId" | realshortchannelid) ::
         ("lastSent" | lengthDelimited(channelReadyCodec))).map {
-      case commitments :: shortChannelId :: lastSent :: HNil =>
-        DATA_WAIT_FOR_CHANNEL_READY(commitments, shortIds = ShortIds(real = RealScidStatus.Temporary(shortChannelId), localAlias = Alias(shortChannelId.toLong), remoteAlias_opt = None), lastSent = lastSent)
+      case commitments :: shortChannelId :: _ :: HNil =>
+        DATA_WAIT_FOR_CHANNEL_READY(commitments, shortIds = ShortIds(real = RealScidStatus.Temporary(shortChannelId), localAlias = Alias(shortChannelId.toLong), remoteAlias_opt = None))
     }.decodeOnly
 
     val DATA_WAIT_FOR_CHANNEL_READY_0a_Codec: Codec[DATA_WAIT_FOR_CHANNEL_READY] = (
       ("commitments" | commitmentsCodec) ::
-        ("shortIds" | shortids) ::
-        ("lastSent" | lengthDelimited(channelReadyCodec))).as[DATA_WAIT_FOR_CHANNEL_READY]
+        ("shortIds" | shortids)).as[DATA_WAIT_FOR_CHANNEL_READY]
 
-    val DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED_0b_Codec: Codec[DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED] = (
-      ("commitments" | commitmentsCodec) ::
-        ("fundingTx" | signedSharedTransactionCodec) ::
-        ("fundingParams" | fundingParamsCodec) ::
-        ("localPushAmount" | millisatoshi) ::
-        ("remotePushAmount" | millisatoshi) ::
-        ("previousFundingTxs" | listOfN(uint16, dualFundingTxCodec)) ::
-        ("waitingSince" | blockHeight) ::
-        ("lastChecked" | blockHeight) ::
-        ("rbfStatus" | provide[RbfStatus](RbfStatus.NoRbf)) ::
-        ("deferred" | optional(bool8, lengthDelimited(channelReadyCodec)))).as[DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED]
+    val DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED_0b_Codec: Codec[DATA_WAIT_FOR_DUAL_FUNDING_CONFIRMED] = fail(Err("you have been running dual funding before it was officially released! contact developers"))
 
     val DATA_WAIT_FOR_DUAL_FUNDING_READY_0c_Codec: Codec[DATA_WAIT_FOR_DUAL_FUNDING_READY] = (
       ("commitments" | commitmentsCodec) ::
-        ("shortIds" | shortids) ::
-        ("lastSent" | lengthDelimited(channelReadyCodec))).as[DATA_WAIT_FOR_DUAL_FUNDING_READY]
+        ("shortIds" | shortids)).as[DATA_WAIT_FOR_DUAL_FUNDING_READY]
+      .decodeOnly
 
     val DATA_NORMAL_02_Codec: Codec[DATA_NORMAL] = (
       ("commitments" | commitmentsCodec) ::
@@ -456,12 +411,13 @@ private[channel] object ChannelCodecs3 {
         ("futureRemoteCommitPublished" | optional(bool8, remoteCommitPublishedCodec)) ::
         ("revokedCommitPublished" | listOfN(uint16, revokedCommitPublishedCodec))).map {
       case commitments :: fundingTx_opt :: waitingSince :: mutualCloseProposed :: mutualClosePublished :: localCommitPublished :: remoteCommitPublished :: nextRemoteCommitPublished :: futureRemoteCommitPublished :: revokedCommitPublished :: HNil =>
-        DATA_CLOSING(commitments, fundingTx_opt.map(tx => SingleFundedUnconfirmedFundingTx(tx)), waitingSince, Nil, mutualCloseProposed, mutualClosePublished, localCommitPublished, remoteCommitPublished, nextRemoteCommitPublished, futureRemoteCommitPublished, revokedCommitPublished)
+        val commitments1 = commitments.modify(_.active.at(0).localFundingStatus).setTo(SingleFundedUnconfirmedFundingTx(fundingTx_opt))
+        DATA_CLOSING(commitments1, waitingSince, commitments1.params.localParams.upfrontShutdownScript_opt.get, mutualCloseProposed, mutualClosePublished, localCommitPublished, remoteCommitPublished, nextRemoteCommitPublished, futureRemoteCommitPublished, revokedCommitPublished)
     }.decodeOnly
 
     val unconfirmedFundingTxCodec: Codec[UnconfirmedFundingTx] = discriminated[UnconfirmedFundingTx].by(uint8)
-      .typecase(0x01, txCodec.as[SingleFundedUnconfirmedFundingTx])
-      .typecase(0x02, signedSharedTransactionCodec.as[DualFundedUnconfirmedFundingTx])
+      .typecase(0x01, txCodec.map(tx => SingleFundedUnconfirmedFundingTx(Some(tx))).decodeOnly)
+      .typecase(0x02, fail[DualFundedUnconfirmedFundingTx](Err("you have been running dual funding before it was officially released! contact developers")))
 
     val DATA_CLOSING_0d_Codec: Codec[DATA_CLOSING] = (
       ("commitments" | commitmentsCodec) ::
@@ -474,7 +430,11 @@ private[channel] object ChannelCodecs3 {
         ("remoteCommitPublished" | optional(bool8, remoteCommitPublishedCodec)) ::
         ("nextRemoteCommitPublished" | optional(bool8, remoteCommitPublishedCodec)) ::
         ("futureRemoteCommitPublished" | optional(bool8, remoteCommitPublishedCodec)) ::
-        ("revokedCommitPublished" | listOfN(uint16, revokedCommitPublishedCodec))).as[DATA_CLOSING]
+        ("revokedCommitPublished" | listOfN(uint16, revokedCommitPublishedCodec))).map {
+      case commitments :: fundingTx_opt :: waitingSince :: _ :: mutualCloseProposed :: mutualClosePublished :: localCommitPublished :: remoteCommitPublished :: nextRemoteCommitPublished :: futureRemoteCommitPublished :: revokedCommitPublished :: HNil =>
+        val commitments1 = commitments.modify(_.active.at(0).localFundingStatus).setTo(SingleFundedUnconfirmedFundingTx(fundingTx_opt.flatMap(_.signedTx_opt)))
+        DATA_CLOSING(commitments1, waitingSince, commitments.params.localParams.upfrontShutdownScript_opt.get, mutualCloseProposed, mutualClosePublished, localCommitPublished, remoteCommitPublished, nextRemoteCommitPublished, futureRemoteCommitPublished, revokedCommitPublished)
+    }.decodeOnly
 
     val DATA_WAIT_FOR_REMOTE_PUBLISH_FUTURE_COMMITMENT_06_Codec: Codec[DATA_WAIT_FOR_REMOTE_PUBLISH_FUTURE_COMMITMENT] = (
       ("commitments" | commitmentsCodec) ::

@@ -17,8 +17,7 @@
 package fr.acinq.eclair.channel.fsm
 
 import akka.actor.typed.scaladsl.adapter.{TypedActorRefOps, actorRefAdapter}
-import fr.acinq.bitcoin.ScriptFlags
-import fr.acinq.bitcoin.scalacompat.{Satoshi, SatoshiLong, Transaction}
+import fr.acinq.bitcoin.scalacompat.{ByteVector32, Satoshi, SatoshiLong, Transaction}
 import fr.acinq.eclair.BlockHeight
 import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher.{GetTxWithMeta, GetTxWithMetaResponse}
 import fr.acinq.eclair.channel._
@@ -27,7 +26,7 @@ import fr.acinq.eclair.channel.publish.TxPublisher.PublishFinalTx
 import fr.acinq.eclair.wire.protocol.Error
 
 import scala.concurrent.duration.DurationInt
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Success}
 
 /**
  * Created by t-bast on 28/03/2022.
@@ -40,11 +39,11 @@ trait SingleFundingHandlers extends CommonFundingHandlers {
 
   this: Channel =>
 
-  def publishFundingTx(commitments: Commitments, fundingTx: Transaction, fundingTxFee: Satoshi): Unit = {
+  def publishFundingTx(channelId: ByteVector32, fundingTx: Transaction, fundingTxFee: Satoshi): Unit = {
     wallet.commit(fundingTx).onComplete {
       case Success(true) =>
-        context.system.eventStream.publish(TransactionPublished(commitments.channelId, remoteNodeId, fundingTx, fundingTxFee, "funding"))
-        channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelOpened(commitments.channelId)))
+        context.system.eventStream.publish(TransactionPublished(channelId, remoteNodeId, fundingTx, fundingTxFee, "funding"))
+        channelOpenReplyToUser(Right(ChannelOpenResponse.ChannelOpened(channelId)))
       case Success(false) =>
         channelOpenReplyToUser(Left(LocalError(new RuntimeException("couldn't publish funding tx"))))
         self ! BITCOIN_FUNDING_PUBLISH_FAILED // fail-fast: this should be returned only when we are really sure the tx has *not* been published
@@ -114,23 +113,21 @@ trait SingleFundingHandlers extends CommonFundingHandlers {
     goto(CLOSED) sending error
   }
 
-  def acceptSingleFundingTx(d: DATA_WAIT_FOR_FUNDING_CONFIRMED, fundingTx: Transaction, realScidStatus: RealScidStatus) = {
-    // As fundee, it is the first time we see the full funding tx, we must verify that it is valid (it pays the correct amount to the correct script)
-    // We also check as funder even if it's not really useful
-    Try(Transaction.correctlySpends(d.commitments.fullySignedLocalCommitTx(keyManager).tx, Seq(fundingTx), ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)) match {
-      case Success(_) =>
-        realScidStatus match {
-          case _: RealScidStatus.Temporary => context.system.eventStream.publish(TransactionConfirmed(d.channelId, remoteNodeId, fundingTx))
-          case _ => () // zero-conf channel
-        }
-        val shortIds = createShortIds(d.channelId, realScidStatus)
-        val channelReady = createChannelReady(shortIds, d.commitments)
-        d.deferred.foreach(self ! _)
-        goto(WAIT_FOR_CHANNEL_READY) using DATA_WAIT_FOR_CHANNEL_READY(d.commitments, shortIds, channelReady) storing() sending channelReady
-      case Failure(t) =>
-        log.error(t, s"rejecting channel with invalid funding tx: ${fundingTx.bin}")
-        goto(CLOSED)
+  def singleFundingMinDepth(d: PersistentChannelData) = {
+    val minDepth_opt = if (d.commitments.params.localParams.isInitiator) {
+      Helpers.Funding.minDepthFunder(d.commitments.params.localParams.initFeatures)
+    } else {
+      // when we're not the channel initiator we scale the min_depth confirmations depending on the funding amount
+      Helpers.Funding.minDepthFundee(nodeParams.channelConf, d.commitments.params.localParams.initFeatures, d.commitments.latest.commitInput.txOut.amount)
     }
+    val minDepth = minDepth_opt.getOrElse {
+      val defaultMinDepth = nodeParams.channelConf.minDepthBlocks
+      // If we are in state WAIT_FOR_FUNDING_CONFIRMED, then the computed minDepth should be > 0, otherwise we would
+      // have skipped this state. Maybe the computation method was changed and eclair was restarted?
+      log.warning("min_depth should be defined since we're waiting for the funding tx to confirm, using default minDepth={}", defaultMinDepth)
+      defaultMinDepth.toLong
+    }
+    minDepth
   }
 
 }

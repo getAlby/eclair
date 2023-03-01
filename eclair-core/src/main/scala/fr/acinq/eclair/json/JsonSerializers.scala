@@ -329,7 +329,7 @@ object RouteShortChannelIdsSerializer extends ConvertClassSerializer[Route](rout
   val hops = route.hops.map(_.shortChannelId)
   val finalHop = route.finalHop_opt.map {
     case _: NodeHop => "trampoline"
-    case _: BlindedHop => "blinded"  
+    case _: BlindedHop => "blinded"
   }
   RouteShortChannelIdsJson(route.amount, hops, finalHop)
 })
@@ -372,8 +372,9 @@ object NodeAddressSerializer extends MinimalSerializer({
 })
 
 // @formatter:off
-private case class DirectedHtlcJson(direction: String, add: UpdateAddHtlc)
-object DirectedHtlcSerializer extends ConvertClassSerializer[DirectedHtlc](h => DirectedHtlcJson(direction = h.direction, add = h.add))
+// We only keep the most important htlc fields: serializing the onion and the tlv stream would waste memory for no good reason.
+private case class DirectedHtlcJson(direction: String, id: Long, amountMsat: MilliSatoshi, paymentHash: ByteVector32, cltvExpiry: CltvExpiry)
+object DirectedHtlcSerializer extends ConvertClassSerializer[DirectedHtlc](h => DirectedHtlcJson(h.direction, h.add.id, h.add.amountMsat, h.add.paymentHash, h.add.cltvExpiry))
 // @formatter:on
 
 object InvoiceSerializer extends MinimalSerializer({
@@ -486,6 +487,11 @@ object OriginSerializer extends MinimalSerializer({
 })
 
 // @formatter:off
+case class CommitmentJson(fundingTx: InputInfo, localFunding: LocalFundingStatus, remoteFunding: RemoteFundingStatus, localCommit: LocalCommit, remoteCommit: RemoteCommit, nextRemoteCommit: Option[RemoteCommit])
+object CommitmentSerializer extends ConvertClassSerializer[Commitment](c => CommitmentJson(c.commitInput, c.localFundingStatus, c.remoteFundingStatus, c.localCommit, c.remoteCommit, c.nextRemoteCommit_opt.map(_.commit)))
+// @formatter:on
+
+// @formatter:off
 private case class GlobalBalanceJson(total: Btc, onChain: CorrectedOnChainBalance, offChain: OffChainBalance)
 object GlobalBalanceSerializer extends ConvertClassSerializer[GlobalBalance](b => GlobalBalanceJson(b.total, b.onChain, b.offChain))
 
@@ -500,6 +506,14 @@ object OnionMessageReceivedSerializer extends ConvertClassSerializer[OnionMessag
 /** this is cosmetic, just to not have a '_opt' field in json, which will only appear if the option is defined anyway */
 private case class ShortIdsJson(real: RealScidStatus, localAlias: Alias, remoteAlias: Option[ShortChannelId])
 object ShortIdsSerializer extends ConvertClassSerializer[ShortIds](s => ShortIdsJson(s.real, s.localAlias, s.remoteAlias_opt))
+// @formatter:on
+
+// @formatter:off
+private case class FundingTxStatusJson(status: String, txid: Option[ByteVector32])
+object FundingTxStatusSerializer extends ConvertClassSerializer[LocalFundingStatus]({
+  case s: LocalFundingStatus.UnconfirmedFundingTx => FundingTxStatusJson("unconfirmed", s.signedTx_opt.map(_.txid))
+  case s: LocalFundingStatus.ConfirmedFundingTx => FundingTxStatusJson("confirmed", s.signedTx_opt.map(_.txid))
+})
 // @formatter:on
 
 case class CustomTypeHints(custom: Map[Class[_], String], override val typeHintFieldName: String = "type") extends TypeHints {
@@ -571,6 +585,11 @@ object CustomTypeHints {
     classOf[RealScidStatus.Temporary] -> "temporary",
     classOf[RealScidStatus.Final] -> "final",
   ), typeHintFieldName = "status")
+
+  val remoteFundingStatuses: CustomTypeHints = CustomTypeHints(Map(
+    classOf[RemoteFundingStatus.NotLocked.type] -> "not-locked",
+    classOf[RemoteFundingStatus.Locked.type] -> "locked",
+  ), typeHintFieldName = "status")
 }
 
 object JsonSerializers {
@@ -585,6 +604,7 @@ object JsonSerializers {
     CustomTypeHints.channelSources +
     CustomTypeHints.channelStates +
     CustomTypeHints.realScidStatuses +
+    CustomTypeHints.remoteFundingStatuses +
     ByteVectorSerializer +
     ByteVector32Serializer +
     ByteVector64Serializer +
@@ -633,6 +653,8 @@ object JsonSerializers {
     PeerInfoSerializer +
     PaymentFailedSummarySerializer +
     OnionMessageReceivedSerializer +
-    ShortIdsSerializer
+    ShortIdsSerializer +
+    FundingTxStatusSerializer +
+    CommitmentSerializer
 
 }

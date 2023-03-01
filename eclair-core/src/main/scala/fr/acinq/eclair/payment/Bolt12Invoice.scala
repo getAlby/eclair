@@ -57,13 +57,22 @@ case class Bolt12Invoice(records: TlvStream[InvoiceTlv]) extends Invoice {
   val signature: ByteVector64 = records.get[Signature].get.signature
 
   // It is assumed that the request is valid for this offer.
-  def isValidFor(request: InvoiceRequest): Boolean = {
-    invoiceRequest.unsigned == request.unsigned &&
-      nodeId == invoiceRequest.offer.nodeId &&
-      !isExpired() &&
-      request.amount.forall(_ == amount) &&
-      Features.areCompatible(request.features, features.bolt12Features()) &&
-      checkSignature()
+  def validateFor(request: InvoiceRequest): Either[String, Unit] = {
+    if (invoiceRequest.unsigned != request.unsigned) {
+      Left("Invoice does not match request")
+    } else if (nodeId != invoiceRequest.offer.nodeId) {
+      Left("Wrong node id")
+    } else if (isExpired()) {
+      Left("Invoice expired")
+    } else if (!request.amount.forall(_ == amount)) {
+      Left("Incompatible amount")
+    } else if (!Features.areCompatible(request.features, features.bolt12Features())) {
+      Left("Incompatible features")
+    } else if (!checkSignature()) {
+      Left("Invalid signature")
+    } else {
+      Right(())
+    }
   }
 
   def checkSignature(): Boolean = {
@@ -101,7 +110,7 @@ object Bolt12Invoice {
             paths: Seq[PaymentBlindedRoute]): Bolt12Invoice = {
     require(request.amount.nonEmpty || request.offer.amount.nonEmpty)
     val amount = request.amount.orElse(request.offer.amount.map(_ * request.quantity)).get
-    val tlvs: Seq[InvoiceTlv] = removeSignature(request.records).records.toSeq ++ Seq(
+    val tlvs: Set[InvoiceTlv] = removeSignature(request.records).records ++ Set(
       Some(InvoicePaths(paths.map(_.route))),
       Some(InvoiceBlindedPay(paths.map(_.paymentInfo))),
       Some(InvoiceCreatedAt(TimestampSecond.now())),
@@ -112,7 +121,7 @@ object Bolt12Invoice {
       Some(InvoiceNodeId(nodeKey.publicKey)),
     ).flatten
     val signature = signSchnorr(signatureTag, rootHash(TlvStream(tlvs, request.records.unknown), OfferCodecs.invoiceTlvCodec), nodeKey)
-    Bolt12Invoice(TlvStream(tlvs :+ Signature(signature), request.records.unknown))
+    Bolt12Invoice(TlvStream(tlvs + Signature(signature), request.records.unknown))
   }
 
   def validate(records: TlvStream[InvoiceTlv]): Either[InvalidTlvPayload, Bolt12Invoice] = {

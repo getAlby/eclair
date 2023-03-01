@@ -61,6 +61,7 @@ class Relayer(nodeParams: NodeParams, router: ActorRef, register: ActorRef, paym
   private val nodeRelayer = context.spawn(Behaviors.supervise(NodeRelayer(nodeParams, register, NodeRelay.SimpleOutgoingPaymentFactory(nodeParams, router, register), triggerer)).onFailure(SupervisorStrategy.resume), name = "node-relayer")
 
   def receive: Receive = {
+    case init: PostRestartHtlcCleaner.Init => postRestartCleaner forward init
     case RelayForward(add) =>
       log.debug(s"received forwarding request for htlc #${add.id} from channelId=${add.channelId}")
       IncomingPaymentPacket.decrypt(add, nodeParams.privateKey, nodeParams.features) match {
@@ -159,7 +160,7 @@ object Relayer extends Logging {
    * @param enabledOnly if true, filter out disabled channels.
    */
   case class GetOutgoingChannels(enabledOnly: Boolean = true)
-  case class OutgoingChannel(shortIds: ShortIds, nextNodeId: PublicKey, channelUpdate: ChannelUpdate, prevChannelUpdate: Option[ChannelUpdate], commitments: AbstractCommitments) extends OutgoingChannelParams {
+  case class OutgoingChannel(shortIds: ShortIds, nextNodeId: PublicKey, channelUpdate: ChannelUpdate, prevChannelUpdate: Option[ChannelUpdate], commitments: Commitments) extends OutgoingChannelParams {
     override val channelId: ByteVector32 = commitments.channelId
     def toChannelBalance: ChannelBalance = ChannelBalance(
       remoteNodeId = nextNodeId,

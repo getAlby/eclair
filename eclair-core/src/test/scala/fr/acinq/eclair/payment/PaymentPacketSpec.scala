@@ -23,13 +23,14 @@ import fr.acinq.eclair.FeatureSupport.{Mandatory, Optional}
 import fr.acinq.eclair.Features._
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.channel.fsm.Channel
-import fr.acinq.eclair.crypto.Sphinx
+import fr.acinq.eclair.crypto.{ShaChain, Sphinx}
 import fr.acinq.eclair.payment.IncomingPaymentPacket.{ChannelRelayPacket, FinalPacket, NodeRelayPacket, decrypt}
 import fr.acinq.eclair.payment.OutgoingPaymentPacket._
 import fr.acinq.eclair.payment.send.{BlindedRecipient, ClearRecipient, ClearTrampolineRecipient}
 import fr.acinq.eclair.router.BaseRouterSpec.{blindedRouteFromHops, channelHopFromUpdate}
 import fr.acinq.eclair.router.BlindedRouteCreation
 import fr.acinq.eclair.router.Router.{NodeHop, Route}
+import fr.acinq.eclair.transactions.Transactions
 import fr.acinq.eclair.transactions.Transactions.InputInfo
 import fr.acinq.eclair.wire.protocol.OfferTypes.{InvoiceRequest, Offer, PaymentInfo}
 import fr.acinq.eclair.wire.protocol.OnionPaymentPayloadTlv.{AmountToForward, OutgoingCltv, PaymentData}
@@ -219,7 +220,7 @@ class PaymentPacketSpec extends AnyFunSuite with BeforeAndAfterAll {
     val blindedRoute = BlindedRouteCreation.createBlindedRouteWithoutHops(c, hex"deadbeef", 1 msat, CltvExpiry(500_000)).route
     val paymentInfo = PaymentInfo(0 msat, 0, CltvExpiryDelta(0), 1 msat, amount_bc, Features.empty)
     val invoice = Bolt12Invoice(invoiceRequest, paymentPreimage, recipientKey, 300 seconds, features, Seq(PaymentBlindedRoute(blindedRoute, paymentInfo)))
-    val recipient = BlindedRecipient(invoice, amount_bc, expiry_bc, Nil)
+    val recipient = BlindedRecipient(invoice, amount_bc, expiry_bc, Set.empty)
     val hops = Seq(channelHopFromUpdate(a, b, channelUpdate_ab), channelHopFromUpdate(b, c, channelUpdate_bc))
     val Right(payment) = buildOutgoingPayment(ActorRef.noSender, priv_a.privateKey, Upstream.Local(UUID.randomUUID()), paymentHash, Route(amount_bc, hops, Some(recipient.blindedHops.head)), recipient)
     assert(payment.outgoingChannel == channelUpdate_ab.shortChannelId)
@@ -470,7 +471,7 @@ class PaymentPacketSpec extends AnyFunSuite with BeforeAndAfterAll {
       val blindedRoute = tmpBlindedRoute.copy(blindedNodes = tmpBlindedRoute.blindedNodes.reverse)
       val paymentInfo = OfferTypes.PaymentInfo(fee_b, 0, channelUpdate_bc.cltvExpiryDelta, 0 msat, amount_bc, Features.empty)
       val invoice = Bolt12Invoice(invoiceRequest, paymentPreimage, priv_c.privateKey, 300 seconds, features, Seq(PaymentBlindedRoute(blindedRoute, paymentInfo)))
-      val recipient = BlindedRecipient(invoice, amount_bc, expiry_bc, Nil)
+      val recipient = BlindedRecipient(invoice, amount_bc, expiry_bc, Set.empty)
       val route = Route(amount_bc, Seq(channelHopFromUpdate(a, b, channelUpdate_ab)), Some(recipient.blindedHops.head))
       (route, recipient)
     }
@@ -699,11 +700,22 @@ object PaymentPacketSpec {
 
   def makeCommitments(channelId: ByteVector32, testAvailableBalanceForSend: MilliSatoshi = 50000000 msat, testAvailableBalanceForReceive: MilliSatoshi = 50000000 msat, testCapacity: Satoshi = 100000 sat, channelFeatures: ChannelFeatures = ChannelFeatures()): Commitments = {
     val channelReserve = testCapacity * 0.01
-    val params = LocalParams(null, null, null, Long.MaxValue.msat, Some(channelReserve), null, null, 0, isInitiator = true, null, None, null)
+    val localParams = LocalParams(null, null, null, Long.MaxValue.msat, Some(channelReserve), null, null, 0, isInitiator = true, None, None, null)
     val remoteParams = RemoteParams(randomKey().publicKey, null, UInt64.MaxValue, Some(channelReserve), null, null, maxAcceptedHtlcs = 0, null, null, null, null, null, null, None)
     val commitInput = InputInfo(OutPoint(randomBytes32(), 1), TxOut(testCapacity, Nil), Nil)
+    val localCommit = LocalCommit(0, null, CommitTxAndRemoteSig(Transactions.CommitTx(commitInput, null), null), Nil)
+    val remoteCommit = RemoteCommit(0, null, null, randomKey().publicKey)
+    val localChanges = LocalChanges(Nil, Nil, Nil)
+    val remoteChanges = RemoteChanges(Nil, Nil, Nil)
     val channelFlags = ChannelFlags.Private
-    new Commitments(channelId, ChannelConfig.standard, channelFeatures, params, remoteParams, channelFlags, null, null, null, null, 0, 0, Map.empty, null, commitInput, null) {
+    new Commitments(
+      ChannelParams(channelId, ChannelConfig.standard, channelFeatures, localParams, remoteParams, channelFlags),
+      CommitmentChanges(localChanges, remoteChanges, 0, 0),
+      List(Commitment(LocalFundingStatus.SingleFundedUnconfirmedFundingTx(None), RemoteFundingStatus.Locked, localCommit, remoteCommit, None)),
+      Right(randomKey().publicKey),
+      ShaChain.init,
+      Map.empty,
+    ) {
       override lazy val availableBalanceForSend: MilliSatoshi = testAvailableBalanceForSend.max(0 msat)
       override lazy val availableBalanceForReceive: MilliSatoshi = testAvailableBalanceForReceive.max(0 msat)
     }

@@ -3,7 +3,7 @@ package fr.acinq.eclair.integration.basic.fixtures
 import akka.actor.typed.Behavior
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.scaladsl.adapter.{ClassicActorRefOps, ClassicActorSystemOps}
-import akka.actor.{ActorRef, ActorSystem}
+import akka.actor.{ActorRef, ActorSystem, typed}
 import akka.testkit.{TestActor, TestProbe}
 import com.softwaremill.quicklens.ModifyPimp
 import com.typesafe.config.ConfigFactory
@@ -19,11 +19,11 @@ import fr.acinq.eclair.channel.fsm.Channel
 import fr.acinq.eclair.crypto.TransportHandler
 import fr.acinq.eclair.crypto.keymanager.{LocalChannelKeyManager, LocalNodeKeyManager}
 import fr.acinq.eclair.io.PeerConnection.ConnectionResult
-import fr.acinq.eclair.io.{Peer, PeerConnection, Switchboard}
+import fr.acinq.eclair.io.{Peer, PeerConnection, PendingChannelsRateLimiter, Switchboard}
 import fr.acinq.eclair.payment.Bolt11Invoice.ExtraHop
 import fr.acinq.eclair.payment._
 import fr.acinq.eclair.payment.receive.{MultiPartHandler, PaymentHandler}
-import fr.acinq.eclair.payment.relay.{ChannelRelayer, Relayer}
+import fr.acinq.eclair.payment.relay.{ChannelRelayer, PostRestartHtlcCleaner, Relayer}
 import fr.acinq.eclair.payment.send.PaymentInitiator
 import fr.acinq.eclair.router.Router
 import fr.acinq.eclair.wire.protocol.IPAddress
@@ -91,10 +91,14 @@ object MinimalNodeFixture extends Assertions with Eventually with IntegrationPat
     val relayer = system.actorOf(Relayer.props(nodeParams, router, register, paymentHandler, triggerer.ref.toTyped), "relayer")
     val txPublisherFactory = Channel.SimpleTxPublisherFactory(nodeParams, watcherTyped, bitcoinClient)
     val channelFactory = Peer.SimpleChannelFactory(nodeParams, watcherTyped, relayer, wallet, txPublisherFactory)
-    val peerFactory = Switchboard.SimplePeerFactory(nodeParams, wallet, channelFactory)
+    val pendingChannelsRateLimiter = system.spawnAnonymous(Behaviors.supervise(PendingChannelsRateLimiter(nodeParams, router.toTyped, Seq())).onFailure(typed.SupervisorStrategy.resume))
+    val peerFactory = Switchboard.SimplePeerFactory(nodeParams, wallet, channelFactory, pendingChannelsRateLimiter)
     val switchboard = system.actorOf(Switchboard.props(nodeParams, peerFactory), "switchboard")
     val paymentFactory = PaymentInitiator.SimplePaymentFactory(nodeParams, router, register)
     val paymentInitiator = system.actorOf(PaymentInitiator.props(nodeParams, paymentFactory), "payment-initiator")
+    val channels = nodeParams.db.channels.listLocalChannels()
+    switchboard ! Switchboard.Init(channels)
+    relayer ! PostRestartHtlcCleaner.Init(channels)
     readyListener.expectMsgAllOf(
       SubscriptionsComplete(classOf[Router]),
       SubscriptionsComplete(classOf[Register]),
@@ -172,7 +176,7 @@ object MinimalNodeFixture extends Assertions with Eventually with IntegrationPat
   }
 
   def fundingTx(node: MinimalNodeFixture, channelId: ByteVector32)(implicit system: ActorSystem): Transaction = {
-    val fundingTxid = getChannelData(node, channelId).asInstanceOf[PersistentChannelData].commitments.fundingTxId
+    val fundingTxid = getChannelData(node, channelId).asInstanceOf[PersistentChannelData].commitments.latest.fundingTxId
     node.wallet.funded(fundingTxid)
   }
 
@@ -203,7 +207,7 @@ object MinimalNodeFixture extends Assertions with Eventually with IntegrationPat
   def confirmChannelDeep(node1: MinimalNodeFixture, node2: MinimalNodeFixture, channelId: ByteVector32, blockHeight: BlockHeight, txIndex: Int)(implicit system: ActorSystem): RealScidStatus.Final = {
     assert(getChannelState(node1, channelId) == NORMAL)
     val data1Before = getChannelData(node1, channelId).asInstanceOf[DATA_NORMAL]
-    val fundingTxid = data1Before.commitments.fundingTxId
+    val fundingTxid = data1Before.commitments.latest.fundingTxId
     val fundingTx = node1.wallet.funded(fundingTxid)
 
     val watch1 = node1.watcher.fishForMessage() { case w: WatchFundingDeeplyBuried if w.txId == fundingTx.txid => true; case _ => false }.asInstanceOf[WatchFundingDeeplyBuried]
@@ -321,7 +325,7 @@ object MinimalNodeFixture extends Assertions with Eventually with IntegrationPat
     val sender = TestProbe("sender")
 
     val routeParams = node1.nodeParams.routerConf.pathFindingExperimentConf.experiments.values.head.getDefaultRouteParams
-    sender.send(node1.paymentInitiator, PaymentInitiator.SendPaymentToNode(amount, invoice, maxAttempts = 1, routeParams = routeParams, blockUntilComplete = true))
+    sender.send(node1.paymentInitiator, PaymentInitiator.SendPaymentToNode(sender.ref, amount, invoice, maxAttempts = 1, routeParams = routeParams, blockUntilComplete = true))
     sender.expectMsgType[PaymentEvent] match {
       case e: PaymentSent => Right(e)
       case e: PaymentFailed => Left(e)

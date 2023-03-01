@@ -16,10 +16,11 @@
 
 package fr.acinq.eclair.wire.protocol
 
+import fr.acinq.bitcoin.scalacompat.ByteVector32
 import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
 import fr.acinq.eclair.UInt64
-import fr.acinq.eclair.wire.protocol.CommonCodecs.{publicKey, varint}
-import fr.acinq.eclair.wire.protocol.TlvCodecs.tlvStream
+import fr.acinq.eclair.wire.protocol.CommonCodecs._
+import fr.acinq.eclair.wire.protocol.TlvCodecs.{tlvField, tlvStream}
 import scodec.Codec
 import scodec.bits.HexStringSyntax
 import scodec.codecs._
@@ -60,7 +61,15 @@ object UpdateFailMalformedHtlcTlv {
 sealed trait CommitSigTlv extends Tlv
 
 object CommitSigTlv {
-  val commitSigTlvCodec: Codec[TlvStream[CommitSigTlv]] = tlvStream(discriminated[CommitSigTlv].by(varint))
+
+  case class FundingTxIdTlv(txId: ByteVector32) extends CommitSigTlv
+
+  private val fundingTxIdCodec: Codec[FundingTxIdTlv] = tlvField(bytes32)
+
+  val commitSigTlvCodec: Codec[TlvStream[CommitSigTlv]] = tlvStream(discriminated[CommitSigTlv].by(varint)
+    .typecase(UInt64(0x47010003), fundingTxIdCodec)
+  )
+
 }
 
 sealed trait RevokeAndAckTlv extends Tlv

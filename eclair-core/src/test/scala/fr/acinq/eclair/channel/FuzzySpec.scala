@@ -84,15 +84,15 @@ class FuzzySpec extends TestKitBaseClass with FixtureAnyFunSuiteLike with Channe
       bob2blockchain.expectMsgType[TxPublisher.SetChannelId]
       pipe ! (alice, bob)
       alice2blockchain.expectMsgType[TxPublisher.SetChannelId]
-      alice2blockchain.expectMsgType[WatchFundingSpent]
       alice2blockchain.expectMsgType[WatchFundingConfirmed]
       bob2blockchain.expectMsgType[TxPublisher.SetChannelId]
-      bob2blockchain.expectMsgType[WatchFundingSpent]
       bob2blockchain.expectMsgType[WatchFundingConfirmed]
       awaitCond(alice.stateName == WAIT_FOR_FUNDING_CONFIRMED)
       val fundingTx = alice.stateData.asInstanceOf[DATA_WAIT_FOR_FUNDING_CONFIRMED].fundingTx_opt.get
       alice ! WatchFundingConfirmedTriggered(BlockHeight(400000), 42, fundingTx)
       bob ! WatchFundingConfirmedTriggered(BlockHeight(400000), 42, fundingTx)
+      alice2blockchain.expectMsgType[WatchFundingSpent]
+      bob2blockchain.expectMsgType[WatchFundingSpent]
       awaitCond(alice.stateName == NORMAL, 1 minute)
       awaitCond(bob.stateName == NORMAL, 1 minute)
     }
@@ -119,7 +119,7 @@ class FuzzySpec extends TestKitBaseClass with FixtureAnyFunSuiteLike with Channe
       // allow overpaying (no more than 2 times the required amount)
       val amount = requiredAmount + Random.nextInt(requiredAmount.toLong.toInt).msat
       val expiry = (Channel.MIN_CLTV_EXPIRY_DELTA + 1).toCltvExpiry(currentBlockHeight = BlockHeight(400000))
-      val Right(payment) = OutgoingPaymentPacket.buildOutgoingPayment(self, randomKey(), Upstream.Local(UUID.randomUUID()), invoice.paymentHash, makeSingleHopRoute(amount, invoice.nodeId), ClearRecipient(invoice, amount, expiry, Nil))
+      val Right(payment) = OutgoingPaymentPacket.buildOutgoingPayment(self, randomKey(), Upstream.Local(UUID.randomUUID()), invoice.paymentHash, makeSingleHopRoute(amount, invoice.nodeId), ClearRecipient(invoice, amount, expiry, Set.empty))
       payment.cmd
     }
 

@@ -16,15 +16,15 @@
 
 package fr.acinq.eclair
 
-import fr.acinq.bitcoin.scalacompat.{Block, ByteVector32, Satoshi, SatoshiLong, Script}
+import fr.acinq.bitcoin.scalacompat.{Block, ByteVector32, Satoshi, SatoshiLong}
 import fr.acinq.eclair.FeatureSupport.{Mandatory, Optional}
 import fr.acinq.eclair.Features._
 import fr.acinq.eclair.blockchain.fee._
-import fr.acinq.eclair.channel.fsm.Channel.{ChannelConf, UnhandledExceptionStrategy}
+import fr.acinq.eclair.channel.fsm.Channel.{ChannelConf, RemoteRbfLimits, UnhandledExceptionStrategy}
 import fr.acinq.eclair.channel.{ChannelFlags, LocalParams}
 import fr.acinq.eclair.crypto.keymanager.{LocalChannelKeyManager, LocalNodeKeyManager}
 import fr.acinq.eclair.io.MessageRelay.RelayAll
-import fr.acinq.eclair.io.{Peer, PeerConnection}
+import fr.acinq.eclair.io.{OpenChannelInterceptor, PeerConnection}
 import fr.acinq.eclair.message.OnionMessages.OnionMessageConfig
 import fr.acinq.eclair.payment.relay.Relayer.{AsyncPaymentsParams, RelayFees, RelayParams}
 import fr.acinq.eclair.router.Graph.WeightRatios
@@ -126,6 +126,10 @@ object TestConstants {
         minFundingPrivateSatoshis = 900 sat,
         maxFundingSatoshis = 16777215 sat,
         requireConfirmedInputsForDualFunding = false,
+        channelOpenerWhitelist = Set.empty,
+        maxPendingChannelsPerPeer = 3,
+        maxTotalPendingChannelsPrivateNodes = 99,
+        remoteRbfLimits = RemoteRbfLimits(5, 0)
       ),
       onChainFeeConf = OnChainFeeConf(
         feeTargets = FeeTargets(6, 2, 36, 12, 18, 0),
@@ -206,15 +210,16 @@ object TestConstants {
       blockchainWatchdogSources = blockchainWatchdogSources,
       onionMessageConfig = OnionMessageConfig(
         relayPolicy = RelayAll,
-        timeout = 1 minute
+        timeout = 1 minute,
+        maxAttempts = 2,
       ),
       purgeInvoicesInterval = None
     )
 
-    def channelParams: LocalParams = Peer.makeChannelParams(
+    def channelParams: LocalParams = OpenChannelInterceptor.makeChannelParams(
       nodeParams,
       nodeParams.features.initFeatures(),
-      Script.write(Script.pay2wpkh(randomKey().publicKey)),
+      None,
       None,
       isInitiator = true,
       dualFunded = false,
@@ -275,6 +280,10 @@ object TestConstants {
         minFundingPrivateSatoshis = 900 sat,
         maxFundingSatoshis = 16777215 sat,
         requireConfirmedInputsForDualFunding = false,
+        channelOpenerWhitelist = Set.empty,
+        maxPendingChannelsPerPeer = 3,
+        maxTotalPendingChannelsPrivateNodes = 99,
+        remoteRbfLimits = RemoteRbfLimits(5, 0)
       ),
       onChainFeeConf = OnChainFeeConf(
         feeTargets = FeeTargets(6, 2, 36, 12, 18, 0),
@@ -355,15 +364,16 @@ object TestConstants {
       blockchainWatchdogSources = blockchainWatchdogSources,
       onionMessageConfig = OnionMessageConfig(
         relayPolicy = RelayAll,
-        timeout = 1 minute
+        timeout = 1 minute,
+        maxAttempts = 2,
       ),
       purgeInvoicesInterval = None
     )
 
-    def channelParams: LocalParams = Peer.makeChannelParams(
+    def channelParams: LocalParams = OpenChannelInterceptor.makeChannelParams(
       nodeParams,
       nodeParams.features.initFeatures(),
-      Script.write(Script.pay2wpkh(randomKey().publicKey)),
+      None,
       None,
       isInitiator = false,
       dualFunded = false,

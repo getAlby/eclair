@@ -22,13 +22,14 @@ import akka.actor.typed.scaladsl.adapter.{ClassicActorRefOps, ClassicActorSystem
 import akka.actor.{ActorRef, ActorSystem, Props, SupervisorStrategy, typed}
 import akka.pattern.after
 import akka.util.Timeout
+import fr.acinq.bitcoin.scalacompat.Crypto.PublicKey
 import fr.acinq.bitcoin.scalacompat.{Block, ByteVector32, Satoshi}
 import fr.acinq.eclair.Setup.Seeds
 import fr.acinq.eclair.balance.{BalanceActor, ChannelsListener}
 import fr.acinq.eclair.blockchain._
-import fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher
 import fr.acinq.eclair.blockchain.bitcoind.rpc.{BasicBitcoinJsonRPCClient, BatchingBitcoinJsonRPCClient, BitcoinCoreClient, BitcoinJsonRPCAuthMethod}
 import fr.acinq.eclair.blockchain.bitcoind.zmq.ZMQActor
+import fr.acinq.eclair.blockchain.bitcoind.{OnchainPubkeyRefresher, ZmqWatcher}
 import fr.acinq.eclair.blockchain.fee._
 import fr.acinq.eclair.channel.Register
 import fr.acinq.eclair.channel.fsm.Channel
@@ -37,10 +38,10 @@ import fr.acinq.eclair.crypto.keymanager.{LocalChannelKeyManager, LocalNodeKeyMa
 import fr.acinq.eclair.db.Databases.FileBackup
 import fr.acinq.eclair.db.FileBackupHandler.FileBackupParams
 import fr.acinq.eclair.db.{Databases, DbEventHandler, FileBackupHandler}
-import fr.acinq.eclair.io.{ClientSpawner, Peer, Server, Switchboard}
+import fr.acinq.eclair.io.{ClientSpawner, Peer, PendingChannelsRateLimiter, Server, Switchboard}
 import fr.acinq.eclair.message.Postman
 import fr.acinq.eclair.payment.receive.PaymentHandler
-import fr.acinq.eclair.payment.relay.{AsyncPaymentTriggerer, Relayer}
+import fr.acinq.eclair.payment.relay.{AsyncPaymentTriggerer, PostRestartHtlcCleaner, Relayer}
 import fr.acinq.eclair.payment.send.{Autoprobe, PaymentInitiator}
 import fr.acinq.eclair.router._
 import fr.acinq.eclair.tor.{Controller, TorProtocolHandler}
@@ -95,6 +96,12 @@ class Setup(val datadir: File,
   val config = system.settings.config.getConfig("eclair")
   val Seeds(nodeSeed, channelSeed) = seeds_opt.getOrElse(NodeParams.getSeeds(datadir))
   val chain = config.getString("chain")
+
+  if (chain != "regtest") {
+    // TODO: database format is WIP, we want to be able to squash changes and not support intermediate unreleased versions
+    throw new RuntimeException("this unreleased version of Eclair only works on regtest")
+  }
+
   val chaindir = new File(datadir, chain)
   chaindir.mkdirs()
   val nodeKeyManager = new LocalNodeKeyManager(nodeSeed, NodeParams.hashFromChain(chain))
@@ -138,8 +145,6 @@ class Setup(val datadir: File,
   val serverBindingAddress = new InetSocketAddress(config.getString("server.binding-ip"), config.getInt("server.port"))
 
   // early checks
-  DBChecker.checkChannelsDB(nodeParams)
-  DBChecker.checkNetworkDB(nodeParams)
   PortChecker.checkAvailable(serverBindingAddress)
 
   logger.info(s"nodeid=${nodeParams.nodeId} alias=${nodeParams.alias}")
@@ -215,6 +220,9 @@ class Setup(val datadir: File,
       postRestartCleanUpInitialized = Promise[Done]()
       channelsListenerReady = Promise[Done]()
 
+      channels = DBChecker.checkChannelsDB(nodeParams)
+      _ = DBChecker.checkNetworkDB(nodeParams)
+
       defaultFeerates = {
         val confDefaultFeerates = FeeratesPerKB(
           mempoolMinFee = FeeratePerKB(Satoshi(config.getLong("on-chain-fees.default-feerates.1008"))),
@@ -255,7 +263,19 @@ class Setup(val datadir: File,
       })
       _ <- feeratesRetrieved.future
 
-      bitcoinClient = new BitcoinCoreClient(bitcoin)
+      finalPubkey = new AtomicReference[PublicKey](null)
+      pubkeyRefreshDelay = FiniteDuration(config.getDuration("bitcoind.final-pubkey-refresh-delay").getSeconds, TimeUnit.SECONDS)
+      bitcoinClient = new BitcoinCoreClient(bitcoin) with OnchainPubkeyCache {
+        val refresher: typed.ActorRef[OnchainPubkeyRefresher.Command] = system.spawn(Behaviors.supervise(OnchainPubkeyRefresher(this, finalPubkey, pubkeyRefreshDelay)).onFailure(typed.SupervisorStrategy.restart), name = "onchain-address-manager")
+
+        override def getP2wpkhPubkey(renew: Boolean): PublicKey = {
+          val key = finalPubkey.get()
+          if (renew) refresher ! OnchainPubkeyRefresher.Renew
+          key
+        }
+      }
+      initialPubkey <- bitcoinClient.getP2wpkhPubkey()
+      _ = finalPubkey.set(initialPubkey)
 
       // If we started funding a transaction and restarted before signing it, we may have utxos that stay locked forever.
       // We want to do something about it: we can unlock them automatically, or let the node operator decide what to do.
@@ -332,15 +352,18 @@ class Setup(val datadir: File,
       paymentHandler = system.actorOf(SimpleSupervisor.props(PaymentHandler.props(nodeParams, register), "payment-handler", SupervisorStrategy.Resume))
       triggerer = system.spawn(Behaviors.supervise(AsyncPaymentTriggerer()).onFailure(typed.SupervisorStrategy.resume), name = "async-payment-triggerer")
       relayer = system.actorOf(SimpleSupervisor.props(Relayer.props(nodeParams, router, register, paymentHandler, triggerer, Some(postRestartCleanUpInitialized)), "relayer", SupervisorStrategy.Resume))
+      _ = relayer ! PostRestartHtlcCleaner.Init(channels)
       // Before initializing the switchboard (which re-connects us to the network) and the user-facing parts of the system,
       // we want to make sure the handler for post-restart broken HTLCs has finished initializing.
       _ <- postRestartCleanUpInitialized.future
 
       txPublisherFactory = Channel.SimpleTxPublisherFactory(nodeParams, watcher, bitcoinClient)
       channelFactory = Peer.SimpleChannelFactory(nodeParams, watcher, relayer, bitcoinClient, txPublisherFactory)
-      peerFactory = Switchboard.SimplePeerFactory(nodeParams, bitcoinClient, channelFactory)
+      pendingChannelsRateLimiter = system.spawn(Behaviors.supervise(PendingChannelsRateLimiter(nodeParams, router.toTyped, channels)).onFailure(typed.SupervisorStrategy.resume), name = "pending-channels-rate-limiter")
+      peerFactory = Switchboard.SimplePeerFactory(nodeParams, bitcoinClient, channelFactory, pendingChannelsRateLimiter)
 
       switchboard = system.actorOf(SimpleSupervisor.props(Switchboard.props(nodeParams, peerFactory), "switchboard", SupervisorStrategy.Resume))
+      _ = switchboard ! Switchboard.Init(channels)
       clientSpawner = system.actorOf(SimpleSupervisor.props(ClientSpawner.props(nodeParams.keyPair, nodeParams.socksProxy_opt, nodeParams.peerConnectionConf, switchboard, router), "client-spawner", SupervisorStrategy.Restart))
       server = system.actorOf(SimpleSupervisor.props(Server.props(nodeParams.keyPair, nodeParams.peerConnectionConf, switchboard, router, serverBindingAddress, Some(tcpBound)), "server", SupervisorStrategy.Restart))
       paymentInitiator = system.actorOf(SimpleSupervisor.props(PaymentInitiator.props(nodeParams, PaymentInitiator.SimplePaymentFactory(nodeParams, router, register)), "payment-initiator", SupervisorStrategy.Restart))
@@ -349,7 +372,7 @@ class Setup(val datadir: File,
       _ = triggerer ! AsyncPaymentTriggerer.Start(switchboard.toTyped)
       balanceActor = system.spawn(BalanceActor(nodeParams.db, bitcoinClient, channelsListener, nodeParams.balanceCheckInterval), name = "balance-actor")
 
-      postman = system.spawn(Behaviors.supervise(Postman(switchboard.toTyped)).onFailure(typed.SupervisorStrategy.restart), name = "postman")
+      postman = system.spawn(Behaviors.supervise(Postman(nodeParams, switchboard.toTyped)).onFailure(typed.SupervisorStrategy.restart), name = "postman")
 
       kit = Kit(
         nodeParams = nodeParams,
@@ -433,7 +456,7 @@ case class Kit(nodeParams: NodeParams,
                channelsListener: typed.ActorRef[ChannelsListener.Command],
                balanceActor: typed.ActorRef[BalanceActor.Command],
                postman: typed.ActorRef[Postman.Command],
-               wallet: OnChainWallet)
+               wallet: OnChainWallet with OnchainPubkeyCache)
 
 object Kit {
 

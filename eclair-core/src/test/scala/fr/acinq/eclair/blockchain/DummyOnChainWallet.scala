@@ -31,7 +31,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 /**
  * Created by PM on 06/07/2017.
  */
-class DummyOnChainWallet extends OnChainWallet {
+class DummyOnChainWallet extends OnChainWallet with OnchainPubkeyCache {
 
   import DummyOnChainWallet._
 
@@ -45,7 +45,7 @@ class DummyOnChainWallet extends OnChainWallet {
 
   override def getP2wpkhPubkey()(implicit ec: ExecutionContext): Future[Crypto.PublicKey] = Future.successful(dummyReceivePubkey)
 
-  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean)(implicit ec: ExecutionContext): Future[FundTransactionResponse] = {
+  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean, externalInputsWeight: Map[OutPoint, Long])(implicit ec: ExecutionContext): Future[FundTransactionResponse] = {
     funded += (tx.txid -> tx)
     Future.successful(FundTransactionResponse(tx, 0 sat, None))
   }
@@ -76,9 +76,10 @@ class DummyOnChainWallet extends OnChainWallet {
 
   override def doubleSpent(tx: Transaction)(implicit ec: ExecutionContext): Future[Boolean] = Future.successful(false)
 
+  override def getP2wpkhPubkey(renew: Boolean): PublicKey = dummyReceivePubkey
 }
 
-class NoOpOnChainWallet extends OnChainWallet {
+class NoOpOnChainWallet extends OnChainWallet with OnchainPubkeyCache {
 
   import DummyOnChainWallet._
 
@@ -91,7 +92,7 @@ class NoOpOnChainWallet extends OnChainWallet {
 
   override def getP2wpkhPubkey()(implicit ec: ExecutionContext): Future[Crypto.PublicKey] = Future.successful(dummyReceivePubkey)
 
-  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean)(implicit ec: ExecutionContext): Future[FundTransactionResponse] = Promise().future // will never be completed
+  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean, externalInputsWeight: Map[OutPoint, Long])(implicit ec: ExecutionContext): Future[FundTransactionResponse] = Promise().future // will never be completed
 
   override def signTransaction(tx: Transaction, allowIncomplete: Boolean)(implicit ec: ExecutionContext): Future[SignTransactionResponse] = Promise().future // will never be completed
 
@@ -112,9 +113,10 @@ class NoOpOnChainWallet extends OnChainWallet {
 
   override def doubleSpent(tx: Transaction)(implicit ec: ExecutionContext): Future[Boolean] = Future.successful(doubleSpent.contains(tx.txid))
 
+  override def getP2wpkhPubkey(renew: Boolean): PublicKey = dummyReceivePubkey
 }
 
-class SingleKeyOnChainWallet extends OnChainWallet {
+class SingleKeyOnChainWallet extends OnChainWallet with OnchainPubkeyCache {
   val privkey = randomKey()
   val pubkey = privkey.publicKey
   // We create a new dummy input transaction for every funding request.
@@ -128,7 +130,7 @@ class SingleKeyOnChainWallet extends OnChainWallet {
 
   override def getP2wpkhPubkey()(implicit ec: ExecutionContext): Future[Crypto.PublicKey] = Future.successful(pubkey)
 
-  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean)(implicit ec: ExecutionContext): Future[FundTransactionResponse] = synchronized {
+  override def fundTransaction(tx: Transaction, feeRate: FeeratePerKw, replaceable: Boolean, externalInputsWeight: Map[OutPoint, Long])(implicit ec: ExecutionContext): Future[FundTransactionResponse] = synchronized {
     val currentAmountIn = tx.txIn.flatMap(txIn => inputs.find(_.txid == txIn.outPoint.txid)).map(_.txOut.head.amount).sum
     val amountOut = tx.txOut.map(_.amount).sum
     // We add a single input to reach the desired feerate.
@@ -188,6 +190,8 @@ class SingleKeyOnChainWallet extends OnChainWallet {
   }
 
   override def doubleSpent(tx: Transaction)(implicit ec: ExecutionContext): Future[Boolean] = Future.successful(doubleSpent.contains(tx.txid))
+
+  override def getP2wpkhPubkey(renew: Boolean): PublicKey = pubkey
 }
 
 object DummyOnChainWallet {
