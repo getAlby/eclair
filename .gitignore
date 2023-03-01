@@ -29,3 +29,5 @@ jdbcUrlFile_*.tmp
 
 .DS_Store
 .vscode
+.metals
+*.bloop
