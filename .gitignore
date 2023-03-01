@@ -32,3 +32,4 @@ jdbcUrlFile_*.tmp
 .metals
 *.bloop
 *.jar
+eclair-node-*
