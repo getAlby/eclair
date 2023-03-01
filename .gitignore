@@ -31,3 +31,4 @@ jdbcUrlFile_*.tmp
 .vscode
 .metals
 *.bloop
+*.jar
